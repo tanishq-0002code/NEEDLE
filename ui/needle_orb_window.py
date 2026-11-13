@@ -45,10 +45,12 @@ class OrbWindow(QWidget):
     voice_triggered = pyqtSignal()
     reset_perch_requested = pyqtSignal()
     quit_requested = pyqtSignal()
+    toggle_enabled_requested = pyqtSignal()
 
     def __init__(self, config=None, parent=None):
         super().__init__(parent)
         self.config = config
+        self.enabled = True
         self._state = "idle"
         self._source = ""
         self._text = ""
@@ -260,6 +262,8 @@ class OrbWindow(QWidget):
         )
         menu.addAction("⚙️ Settings & Control Center", self.settings_requested.emit)
         menu.addAction("🎙️ Trigger Voice / Wake Word", self.voice_triggered.emit)
+        toggle_label = "🔴 Disable Needle" if self.enabled else "🟢 Enable Needle"
+        menu.addAction(toggle_label, self.toggle_enabled_requested.emit)
         menu.addAction("📍 Reset to Default Perch", lambda: (self.reset_perch(), self.reset_perch_requested.emit()))
         menu.addSeparator()
         menu.addAction("❌ Quit Needle", self.quit_requested.emit)

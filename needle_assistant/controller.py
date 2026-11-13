@@ -37,14 +37,17 @@ class AssistantController(QObject):
         super().__init__()
         self.app = app
         self.config = config
+        self.enabled = bool(getattr(config, "enabled", True))
         self.router = NeedleRouter(
             max_new_tokens=config.max_new_tokens,
             threads=config.threads,
             log_transcripts=config.log_transcripts,
         )
         self.overlay = OverlayWindow(config)
+        self.overlay.enabled = self.enabled
         self.overlay.settings_requested.connect(self.show_settings)
         self.overlay.voice_triggered.connect(lambda: self.trigger("tray"))
+        self.overlay.toggle_enabled_requested.connect(lambda: self.toggle_enabled(not self.enabled))
         self.overlay.reset_perch_requested.connect(self.overlay.reset_perch)
         self.overlay.quit_requested.connect(self.quit)
         self.audio = AudioEngine(config)
@@ -88,9 +91,10 @@ class AssistantController(QObject):
         # semantic router warms up in the background.
         thread = threading.Thread(target=self._load_router_worker, name="NeedleLoad", daemon=True)
         thread.start()
-        self.audio.start()
-        self.hotkey.start(self.config.hotkey)
-        self.outside.start()
+        if self.enabled:
+            self.audio.start()
+            self.hotkey.start(self.config.hotkey)
+            self.outside.start()
         self._emit_status()
         self._refresh_settings_status()
 
@@ -320,6 +324,55 @@ class AssistantController(QObject):
         else:
             self._emit_status()
 
+    def toggle_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self.enabled and self.config.enabled == enabled:
+            self.overlay.enabled = enabled
+            return
+        self.enabled = enabled
+        self.config.enabled = enabled
+        self.config.validate()
+        save_config(self.config)
+        if enabled:
+            try:
+                self.audio.start()
+            except Exception:
+                log.exception("Could not start audio.")
+            try:
+                self.hotkey.start(self.config.hotkey)
+            except Exception:
+                log.exception("Could not start hotkey.")
+            try:
+                self.outside.start()
+            except Exception:
+                log.exception("Could not start outside watcher.")
+            self.overlay.enabled = True
+            self.overlay.show_welcome()
+        else:
+            try:
+                self.hotkey.stop()
+            except Exception:
+                pass
+            try:
+                self.outside.stop()
+            except Exception:
+                pass
+            try:
+                self.audio.stop()
+            except Exception:
+                pass
+            self.overlay.enabled = False
+            self.overlay.hide_immediately()
+        if self.settings is not None:
+            self.settings.config = self.config
+            try:
+                self.settings.enable_check.setChecked(bool(enabled))
+            except Exception:
+                pass
+        self.config_changed.emit(self.config)
+        self._emit_status()
+        self._refresh_settings_status()
+
     # ------------------------------------------------------------------ settings
     def show_settings(self) -> None:
         self._capture_foreground()
@@ -373,9 +426,12 @@ class AssistantController(QObject):
             self.audio.restart(self.config)
         else:
             self.audio.reload(self.config)
-        self.config_changed.emit(self.config)
-        self._emit_status()
-        self._refresh_settings_status()
+        if old.enabled != self.config.enabled:
+            self.toggle_enabled(self.config.enabled)
+        else:
+            self.config_changed.emit(self.config)
+            self._emit_status()
+            self._refresh_settings_status()
         self.notify.emit("Settings saved", "Your changes are active.")
 
     def toggle_wake(self, enabled: bool) -> None:

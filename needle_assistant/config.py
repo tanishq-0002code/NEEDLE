@@ -64,6 +64,7 @@ def normalize_wake_phrases(values: list[str] | str) -> list[str]:
 @dataclass
 class AppConfig:
     hotkey: str = DEFAULT_HOTKEY
+    enabled: bool = True
     wake_word_enabled: bool = True
     wake_phrases: list[str] = field(default_factory=lambda: list(DEFAULT_WAKE_PHRASES))
     microphone_index: int | None = None

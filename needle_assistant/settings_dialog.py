@@ -237,6 +237,10 @@ class SettingsDialog(QDialog):
         self.tokens_spin.setSingleStep(16)
         self.tokens_spin.setToolTip("Lower values finish faster. 128 is recommended on a 2-core CPU.")
         grid.addWidget(self.tokens_spin, 8, 1)
+
+        grid.addWidget(self._label("Enable Needle"), 9, 0)
+        self.enable_check = QCheckBox("Enable Needle Desktop (listening, hotkey, and wake word)", card)
+        grid.addWidget(self.enable_check, 9, 1)
         layout.addLayout(grid)
         return card
 
@@ -250,6 +254,7 @@ class SettingsDialog(QDialog):
         config = self.config
         self.hotkey_edit.setKeySequence(QKeySequence(self._qt_hotkey(config.hotkey)))
         self.wake_check.setChecked(config.wake_word_enabled)
+        self.enable_check.setChecked(bool(getattr(config, "enabled", True)))
         self.phrases_edit.setText(", ".join(config.wake_phrases))
         index = self.mic_combo.findData(config.microphone_index)
         self.mic_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -321,6 +326,7 @@ class SettingsDialog(QDialog):
         updated = AppConfig.from_dict(self.config.to_dict())
         updated.hotkey = hotkey
         updated.wake_word_enabled = self.wake_check.isChecked()
+        updated.enabled = self.enable_check.isChecked()
         updated.wake_phrases = phrases or updated.wake_phrases
         updated.microphone_index = self.mic_combo.currentData()
         updated.fast_intent = self.fast_check.isChecked()
