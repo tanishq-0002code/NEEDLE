@@ -84,6 +84,8 @@ hiddenimports = [
     "PyQt6.QtCore",
     "PyQt6.QtGui",
     "PyQt6.QtWidgets",
+    "ui",
+    "ui.needle_orb_window",
 ]
 
 excludes = [
