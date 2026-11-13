@@ -13,3 +13,9 @@ dist/
 *.log
 selftest*.png
 overlay-*.png
+
+# Whisper local test artifacts
+whispercpp/
+models/
+test_recording.wav
+
