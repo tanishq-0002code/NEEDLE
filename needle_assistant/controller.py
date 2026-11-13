@@ -43,6 +43,10 @@ class AssistantController(QObject):
             log_transcripts=config.log_transcripts,
         )
         self.overlay = OverlayWindow(config)
+        self.overlay.settings_requested.connect(self.show_settings)
+        self.overlay.voice_triggered.connect(lambda: self.trigger("tray"))
+        self.overlay.reset_perch_requested.connect(self.overlay.reset_perch)
+        self.overlay.quit_requested.connect(self.quit)
         self.audio = AudioEngine(config)
         self.hotkey = HotkeyManager()
         self.outside = OutsideClickWatcher()

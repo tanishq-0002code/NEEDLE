@@ -19,6 +19,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QBrush,
     QColor,
+    QAction,
     QCursor,
     QFont,
     QLinearGradient,
@@ -27,7 +28,7 @@ from PyQt6.QtGui import (
     QPen,
     QRadialGradient,
 )
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtWidgets import QApplication, QMenu, QWidget
 
 
 
@@ -40,6 +41,10 @@ ORB_CENTER = QPointF(65, 78)
 class OrbWindow(QWidget):
     dismissed = pyqtSignal()
     hidden = pyqtSignal()
+    settings_requested = pyqtSignal()
+    voice_triggered = pyqtSignal()
+    reset_perch_requested = pyqtSignal()
+    quit_requested = pyqtSignal()
 
     def __init__(self, config=None, parent=None):
         super().__init__(parent)
@@ -231,6 +236,35 @@ class OrbWindow(QWidget):
             self.move(self._resting_pos or self.pos())
             self.raise_()
             self.setWindowOpacity(1.0)
+
+    def reset_perch(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            self._resting_pos = QPoint(
+                avail.x() + avail.width() - CANVAS - 24,
+                avail.y() + avail.height() - CANVAS - 24,
+            )
+        else:
+            self._resting_pos = QPoint(100, 100)
+        self.move(self._resting_pos)
+        self.show_animated()
+
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: rgba(15, 23, 42, 230); color: #F2F3FA; "
+            "border: 1px solid rgba(255, 255, 255, 30); border-radius: 10px; padding: 6px; }"
+            "QMenu::item { padding: 8px 18px; border-radius: 6px; }"
+            "QMenu::item:selected { background-color: rgba(59, 130, 246, 0.35); }"
+        )
+        menu.addAction("⚙️ Settings & Control Center", self.settings_requested.emit)
+        menu.addAction("🎙️ Trigger Voice / Wake Word", self.voice_triggered.emit)
+        menu.addAction("📍 Reset to Default Perch", lambda: (self.reset_perch(), self.reset_perch_requested.emit()))
+        menu.addSeparator()
+        menu.addAction("❌ Quit Needle", self.quit_requested.emit)
+        menu.exec(event.globalPos())
+        event.accept()
 
     def contains_global_point(self, x: int, y: int) -> bool:
         if not self.isVisible():
@@ -503,7 +537,6 @@ class OrbWindow(QWidget):
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
         elif event.button() == Qt.MouseButton.RightButton:
-            self.dismissed.emit()
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:
