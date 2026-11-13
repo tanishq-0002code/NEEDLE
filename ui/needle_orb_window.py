@@ -63,6 +63,8 @@ class OrbWindow(QWidget):
         self._animations: list[QPropertyAnimation] = []
         self._group = None
         self._time = 0.0
+        self._velocity = QPointF(0.0, 0.0)
+        self._prev_pos = self.pos()
         self._bob_phase = 0.0
         self._blink_start = 0.0
         self._last_blink = time.monotonic()
@@ -397,6 +399,13 @@ class OrbWindow(QWidget):
         else:
             self._tilt = 0.0
 
+        try:
+            cur = self.pos()
+            self._velocity = QPointF(cur.x() - self._prev_pos.x(), cur.y() - self._prev_pos.y())
+            self._prev_pos = cur
+        except Exception:
+            self._velocity = QPointF(0.0, 0.0)
+
         self.update()
 
     def _tick_status(self) -> None:
@@ -410,71 +419,108 @@ class OrbWindow(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        center = QPointF(ORB_CENTER.x(), ORB_CENTER.y() + self._bob_y())
-        radius = ORB / 2.0
-
-        # outer glow / halo
-        if self._state == "listening":
-            halo = QRadialGradient(center, radius + 26)
-            halo.setColorAt(0.0, QColor(59, 130, 246, 120))
-            halo.setColorAt(0.6, QColor(59, 130, 246, 60))
-            halo.setColorAt(1.0, QColor(59, 130, 246, 0))
-            p.setBrush(halo)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(center, radius + 26, radius + 26)
-
+        # breathing / morph scale
         if self._state == "executing":
-            glow = QRadialGradient(center, radius + 18)
-            glow.setColorAt(0.0, QColor(96, 165, 250, 90))
-            glow.setColorAt(1.0, QColor(96, 165, 250, 0))
-            p.setBrush(glow)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(center, radius + 18, radius + 18)
+            speed = math.hypot(self._velocity.x(), self._velocity.y())
+            stretch = self._clamp(speed / 18.0, 0.0, 0.18)
+            scale_x = 1.0 + stretch * 0.55
+            scale_y = 1.0 - stretch * 0.35
+            breath = 1.0
+        else:
+            breath = 1.0 + 0.03 * math.sin(self._time * 1.35)
+            scale_x = breath
+            scale_y = breath
 
-        # subtle shadow
-        shadow = QRadialGradient(center.x(), center.y() + 6, radius + 8)
-        shadow.setColorAt(0.0, QColor(0, 0, 0, 70))
+        cx = ORB_CENTER.x()
+        cy = ORB_CENTER.y() + self._bob_y()
+        center = QPointF(cx, cy)
+        radius = (ORB / 2.0) * breath
+
+        # --- multi-layered liquid aura glow ---
+        aura_radius = radius + 34
+        # outer soft cyan aura
+        g1 = QRadialGradient(center.x() + math.sin(self._time * 0.9) * 6,
+                            center.y() + math.cos(self._time * 1.1) * 6, aura_radius)
+        g1.setColorAt(0.0, QColor(56, 189, 248, 95))
+        g1.setColorAt(0.45, QColor(37, 99, 235, 55))
+        g1.setColorAt(1.0, QColor(37, 99, 235, 0))
+        p.setBrush(g1)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(center, aura_radius, aura_radius)
+
+        # mid cobalt aura
+        g2 = QRadialGradient(center.x() - math.sin(self._time * 1.2) * 4,
+                            center.y() - math.cos(self._time * 0.8) * 4, radius + 16)
+        g2.setColorAt(0.0, QColor(37, 99, 235, 110))
+        g2.setColorAt(0.7, QColor(37, 99, 235, 30))
+        g2.setColorAt(1.0, QColor(37, 99, 235, 0))
+        p.setBrush(g2)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(center, radius + 16, radius + 16)
+
+        # listening ripple ring
+        if self._state == "listening":
+            rr = radius + 22 + 4 * math.sin(self._time * 6.0)
+            ring = QRadialGradient(center, rr)
+            ring.setColorAt(0.0, QColor(59, 130, 246, 0))
+            ring.setColorAt(0.75, QColor(59, 130, 246, 150))
+            ring.setColorAt(1.0, QColor(59, 130, 246, 0))
+            p.setBrush(ring)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(center, rr, rr)
+
+        # shadow
+        shadow = QRadialGradient(center.x(), center.y() + 8, radius + 10)
+        shadow.setColorAt(0.0, QColor(0, 0, 0, 80))
         shadow.setColorAt(1.0, QColor(0, 0, 0, 0))
         p.setBrush(shadow)
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(center.x(), center.y() + 8), radius + 6, radius + 6)
+        p.drawEllipse(QPointF(center.x(), center.y() + 10), radius + 8, radius + 8)
 
         # sphere
         p.save()
         p.translate(center)
+        p.scale(scale_x, scale_y)
         p.rotate(self._tilt)
-        grad = QRadialGradient(QPointF(-16, -18), radius * 1.4)
+
+        grad = QRadialGradient(QPointF(-16, -18), radius * 1.5)
         grad.setColorAt(0.0, QColor("#CBE5FF"))
-        grad.setColorAt(0.35, QColor("#7CB9FF"))
-        grad.setColorAt(0.70, QColor("#4389F5"))
+        grad.setColorAt(0.25, QColor("#7CB9FF"))
+        grad.setColorAt(0.60, QColor("#4389F5"))
         grad.setColorAt(1.0, QColor("#2563EB"))
         p.setBrush(grad)
-        p.setPen(QPen(QColor(255, 255, 255, 50), 1.0))
+        p.setPen(QPen(QColor(255, 255, 255, 55), 1.0))
         p.drawEllipse(QPointF(0, 0), radius, radius)
 
+        # violet inner core
+        core = QRadialGradient(QPointF(8, 10), radius * 0.75)
+        core.setColorAt(0.0, QColor(192, 132, 252, 70))
+        core.setColorAt(1.0, QColor(192, 132, 252, 0))
+        p.setBrush(core)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(0, 0), radius * 0.85, radius * 0.85)
+
         # glossy highlight
-        hi = QRadialGradient(QPointF(-14, -20), 26)
-        hi.setColorAt(0.0, QColor(255, 255, 255, 150))
+        hi = QRadialGradient(QPointF(-16, -20), 28)
+        hi.setColorAt(0.0, QColor(255, 255, 255, 170))
         hi.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.setBrush(hi)
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(-12, -18), 22, 16)
+        p.drawEllipse(QPointF(-12, -18), 24, 18)
 
-        # inner rim
+        # rim
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 35), 1.0))
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1.0))
         p.drawEllipse(QPointF(0, 0), radius - 1, radius - 1)
 
         # eyes
         if self._state == "happy":
-            # curved arches
             pen = QPen(QColor("#F4F9FF"), 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawArc(QRectF(-22, -12, 16, 12), 30 * 16, 120 * 16)
             p.drawArc(QRectF(6, -12, 16, 12), 30 * 16, 120 * 16)
         elif self._state == "thinking":
-            # asymmetric squint
             self._draw_eye(p, QPointF(-16, -4), 11, 12, self._pupil, squint=0.55)
             self._draw_eye(p, QPointF(16, -4), 11, 22, self._pupil, squint=1.0)
         else:
@@ -482,7 +528,6 @@ class OrbWindow(QWidget):
                 ew, eh = 13, 23
             else:
                 ew, eh = 11, 20
-            # blink
             eh = max(2.0, eh * (1.0 - self._blink * 0.92))
             self._draw_eye(p, QPointF(-16, -4), ew, eh, self._pupil)
             self._draw_eye(p, QPointF(16, -4), ew, eh, self._pupil)
