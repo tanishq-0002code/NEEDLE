@@ -131,15 +131,23 @@ class AudioWorker(threading.Thread):
             import sounddevice as sd
 
             device = self._device_index
-            source_rate = SAMPLE_RATE
+            # Use the microphone's native rate and resample to 16 kHz for
+            # Vosk.  Forcing 16 kHz on MME can silently capture distorted or
+            # empty audio on some Realtek and Bluetooth devices.
             try:
-                if device is not None:
-                    sd.check_input_settings(device=device, samplerate=SAMPLE_RATE, channels=1, dtype="int16")
-                else:
-                    sd.check_input_settings(samplerate=SAMPLE_RATE, channels=1, dtype="int16")
-            except Exception:
-                info = sd.query_devices(device if device is not None else sd.default.device[0], "input")
+                default_input = sd.default.device[0]
+                info = sd.query_devices(device if device is not None else default_input, "input")
                 source_rate = int(info.get("default_samplerate") or SAMPLE_RATE)
+            except Exception:
+                source_rate = SAMPLE_RATE
+            try:
+                sd.check_input_settings(device=device, samplerate=source_rate, channels=1, dtype="int16")
+            except Exception:
+                source_rate = SAMPLE_RATE
+                try:
+                    sd.check_input_settings(device=device, samplerate=source_rate, channels=1, dtype="int16")
+                except Exception:
+                    pass
             frames = int(source_rate * BLOCK_SECONDS)
             stream = sd.RawInputStream(
                 samplerate=source_rate,
@@ -314,6 +322,8 @@ class AudioWorker(threading.Thread):
                             self._trigger_wake(phrase)
                             command_recognizer = self._new_command_recognizer()
                             self._set_mode("command")
+                        elif text:
+                            log.debug("Wake recognizer heard %r (no phrase match).", text)
                     else:
                         try:
                             partial = json.loads(wake_recognizer.PartialResult()).get("partial", "")
@@ -324,6 +334,8 @@ class AudioWorker(threading.Thread):
                             self._trigger_wake(phrase)
                             command_recognizer = self._new_command_recognizer()
                             self._set_mode("command")
+                        elif partial:
+                            log.debug("Wake partial: %r", partial)
                 elif self._mode == "command":
                     if command_recognizer is None:
                         command_recognizer = self._new_command_recognizer()

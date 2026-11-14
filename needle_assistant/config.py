@@ -10,7 +10,7 @@ from typing import Any
 
 from .paths import config_path
 
-DEFAULT_WAKE_PHRASES = ["hey jarvis", "hey computer"]
+DEFAULT_WAKE_PHRASES = ["hey needle", "hey jarvis", "hey computer"]
 DEFAULT_HOTKEY = "ctrl+space"
 
 _MODIFIERS = {"ctrl", "control", "alt", "shift", "win", "windows", "cmd", "super", "meta"}
@@ -116,7 +116,16 @@ def load_config(path: Path | None = None) -> AppConfig:
     try:
         with open(target, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-        return AppConfig.from_dict(data)
+        config = AppConfig.from_dict(data)
+        # Older installs defaulted to Jarvis/Computer only.  Add the
+        # product's own wake phrase so "Hey Needle" works out of the box.
+        if config.wake_phrases == ["hey jarvis", "hey computer"]:
+            config.wake_phrases = list(DEFAULT_WAKE_PHRASES)
+            try:
+                save_config(config, target)
+            except OSError:
+                pass
+        return config
     except FileNotFoundError:
         return AppConfig()
     except (OSError, ValueError, TypeError, json.JSONDecodeError):

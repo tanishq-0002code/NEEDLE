@@ -6,7 +6,7 @@ No cloud APIs, no accounts, no telemetry. The microphone, speech recognition, in
 
 ## What it does
 
-- **Wake word** — offline Vosk recognition for `hey jarvis` and `hey computer` (editable in Settings).
+- **Wake word** — offline Vosk recognition for `hey needle`, `hey jarvis`, and `hey computer` (editable in Settings).
 - **Global hotkey** — `Ctrl+Space` by default (editable in Settings).
 - **Gemini-style popup** — frameless, translucent, always-on-top, bottom-center, with a glowing audio wave and live transcript.
 - **Local routing** — a conservative fast path handles common phrasings instantly; Needle 3 handles novel/ambiguous commands through the official Cactus engine and `needle3.cact` weights.
@@ -111,7 +111,7 @@ The frozen selftest writes its report to:
 3. Leave the app running in the system tray.
 4. Trigger a command in any of these ways:
    - Press `Ctrl+Space`.
-   - Say **“Hey Jarvis”** or **“Hey Computer”**.
+   - Say **“Hey Needle”**, **“Hey Jarvis”**, or **“Hey Computer”**.
    - Right-click the tray icon → **Type a command…**
 5. Speak or type, for example:
    - “Open Notepad”

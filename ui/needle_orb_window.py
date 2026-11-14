@@ -73,6 +73,7 @@ class OrbWindow(QWidget):
         self._tilt = 0.0
         self._hop = 0.0
         self._tap = 0.0
+        self._accent = QColor("#8B7CFF")
 
         self.setWindowTitle("Needle Desktop")
         self.setWindowFlags(
@@ -157,6 +158,24 @@ class OrbWindow(QWidget):
         text = (text or "").strip()
         self._text = text if text else "Say a command…"
         self._muted = not bool(text)
+
+    def set_thinking(self, text: str = "") -> None:
+        """Enter the routing/thinking state and show the recognized command."""
+        self._set_state("thinking")
+        text = " ".join((text or "").split())
+        self._text = text or "Thinking…"
+        self._muted = not bool(text)
+        self.show_animated()
+
+    def set_accent(self, accent: str) -> None:
+        """Store the user-selected accent color for future themed drawing."""
+        try:
+            color = QColor(accent)
+            if color.isValid():
+                self._accent = color
+        except Exception:
+            pass
+        self.update()
 
     def set_level(self, level: float) -> None:
         self._level = self._clamp(float(level), 0.0, 1.0)
@@ -535,7 +554,7 @@ class OrbWindow(QWidget):
         p.restore()
 
         # speech pill
-        if self._state in ("listening", "thinking", "error", "welcome", "happy") and self._text:
+        if self._state in ("listening", "thinking", "executing", "error", "welcome", "happy") and self._text:
             self._draw_pill(p, self._text, self._muted)
 
         p.end()
