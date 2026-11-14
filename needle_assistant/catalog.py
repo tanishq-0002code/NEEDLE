@@ -1031,6 +1031,44 @@ def fast_route(text: str) -> ToolCall | None:
             return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                             reasoning="Matched search phrase.", user_text=text)
 
+    # "send a whatsapp message to X" -> open WhatsApp Web in Microsoft Edge
+    if re.fullmatch(
+        r"(?:please\s+)?(?:send|write|compose|type)\s+(?:a\s+|an\s+)?(?:whatsapp\s+)?(?:message|msg|text)(?:\s+to\s+[^.!?]+)?",
+        cleaned,
+        re.I,
+    ) or re.fullmatch(
+        r"(?:please\s+)?(?:send\s+)?(?:a\s+)?whatsapp(?:\s+(?:message|msg|text))?(?:\s+to\s+[^.!?]+)?",
+        cleaned,
+        re.I,
+    ) or re.search(
+        r"\bwhatsapp\b.*(?:message|msg|text)",
+        cleaned,
+        re.I,
+    ) or re.search(
+        r"(?:message|msg|text).*\bwhatsapp\b",
+        cleaned,
+        re.I,
+    ):
+        try:
+            name, arguments = validate_call(
+                "browser_control", {"action": "open_url", "url": "https://web.whatsapp.com/", "browser": "edge"}
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched WhatsApp-message phrase.", user_text=text)
+
+    # Opening WhatsApp defaults to WhatsApp Web in Edge, not the standalone app.
+    if re.fullmatch(r"(?:please\s+)?(?:open|launch|start)\s+(?:the\s+)?whatsapp(?:\s+(?:web|desktop))?", original, re.I):
+        try:
+            name, arguments = validate_call(
+                "browser_control", {"action": "open_url", "url": "https://web.whatsapp.com/", "browser": "edge"}
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched WhatsApp open phrase.", user_text=text)
+
     sleep_match = _SLEEP_RE.fullmatch(cleaned)
     # "open new tab" / "new tab" / "close tab" / "next tab"
     if re.fullmatch(r"(?:please\s+)?(?:open\s+)?(?:a\s+)?new\s+tab", original, re.I):
