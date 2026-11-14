@@ -1452,7 +1452,7 @@ class DesktopAutomation:
 
     def _browser_control(self, action: str, url: str = "", browser: str = "", target: str = "") -> ExecutionResult:
         action = (action or "").strip().lower()
-        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page"}:
+        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result"}:
             raise AutomationError("Unsupported browser action.")
         if action == "open_url":
             url = str(url or "").strip()

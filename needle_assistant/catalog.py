@@ -1032,6 +1032,35 @@ def fast_route(text: str) -> ToolCall | None:
                             reasoning="Matched search phrase.", user_text=text)
 
     sleep_match = _SLEEP_RE.fullmatch(cleaned)
+    # "open new tab" / "new tab" / "close tab" / "next tab"
+    if re.fullmatch(r"(?:please\s+)?(?:open\s+)?(?:a\s+)?new\s+tab", original, re.I):
+        try:
+            name, arguments = validate_call("browser_control", {"action": "tab_new"})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched new-tab phrase.", user_text=text)
+    if re.fullmatch(r"(?:please\s+)?(?:close|close the)\s+(?:this\s+)?(?:browser\s+)?tab", original, re.I):
+        try:
+            name, arguments = validate_call("browser_control", {"action": "tab_close"})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched close-tab phrase.", user_text=text)
+    if re.fullmatch(r"(?:please\s+)?next\s+tab", original, re.I):
+        try:
+            name, arguments = validate_call("browser_control", {"action": "tab_next"})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched next-tab phrase.", user_text=text)
+    if re.fullmatch(r"(?:please\s+)?previous\s+tab", original, re.I):
+        try:
+            name, arguments = validate_call("browser_control", {"action": "tab_prev"})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched previous-tab phrase.", user_text=text)
     # "shortcut <trigger> = <steps>" management
     shortcut_parsed = _shortcut_from_request(text)
     if shortcut_parsed and re.search(r"\b(?:shortcut|remember shortcut|save shortcut)\b", cleaned, re.I):
