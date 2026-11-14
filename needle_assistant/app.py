@@ -40,24 +40,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _safe_text(value: object) -> str:
+    text = str(value or "")
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        return text.encode(encoding, "replace").decode(encoding)
+    except (LookupError, UnicodeError):
+        return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def _check(results: list[dict], name: str, function) -> bool:
     started = time.monotonic()
     try:
         detail = function()
         duration = time.monotonic() - started
-        results.append({"name": name, "ok": True, "detail": str(detail or ""), "seconds": round(duration, 2)})
-        print(f"[ok]   {name} ({duration:.2f}s) {detail or ''}")
+        text = str(detail or "")
+        results.append({"name": name, "ok": True, "detail": text, "seconds": round(duration, 2)})
+        print(f"[ok]   {name} ({duration:.2f}s) {_safe_text(text)}")
         return True
     except Exception as exc:
         duration = time.monotonic() - started
+        text = f"{type(exc).__name__}: {exc}"
         results.append({
             "name": name,
             "ok": False,
-            "detail": f"{type(exc).__name__}: {exc}",
+            "detail": text,
             "traceback": traceback.format_exc(),
             "seconds": round(duration, 2),
         })
-        print(f"[fail] {name} ({duration:.2f}s): {exc}")
+        print(f"[fail] {name} ({duration:.2f}s): {_safe_text(text)}")
         return False
 
 

@@ -1005,6 +1005,9 @@ class DesktopAutomation:
         except Exception:
             pass
         return name
+
+    @staticmethod
+    def _windows_by_title(title: str) -> list[win.WindowInfo]:
         wanted = re.sub(r"\s+", " ", str(title or "").strip().lower())
         if not wanted:
             return []

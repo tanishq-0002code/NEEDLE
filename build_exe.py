@@ -112,7 +112,8 @@ def verify(exe: Path) -> None:
             print(f"Selftest report: {report_path}")
             print(f"Selftest success: {report.get('success')}")
             for item in report.get("checks", []):
-                print(f"  [{'ok' if item.get('ok') else 'fail'}] {item.get('name')}: {item.get('detail')}")
+                detail = str(item.get("detail") or "").encode("utf-8", "replace").decode("utf-8")
+                print(f"  [{'ok' if item.get('ok') else 'fail'}] {item.get('name')}: {detail}")
         except Exception as exc:
             print(f"Could not read selftest report: {exc}")
     if result.returncode != 0:
