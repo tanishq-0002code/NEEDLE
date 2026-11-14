@@ -85,6 +85,8 @@ class AudioWorker(threading.Thread):
         self._source_rate = SAMPLE_RATE
         self._read_frames = DEFAULT_BLOCK
         self._device_index = config.microphone_index
+        self._active_device: int | None = None
+        self._open_failures = 0
         self._noise_floor = 180.0
         self._reset_command_state()
 
@@ -103,6 +105,7 @@ class AudioWorker(threading.Thread):
         self.config = config
         self._phrases = list(config.wake_phrases)
         self._device_index = config.microphone_index
+        self._active_device = None
         self.commands.put("wake_on" if config.wake_word_enabled else "wake_off")
 
     def _emit(self, signal, *args) -> None:
@@ -125,50 +128,87 @@ class AudioWorker(threading.Thread):
             except Exception:
                 pass
 
-    def _open_stream(self) -> bool:
+    def _candidate_devices(self, sd) -> list[int | None]:
+        """Devices to try, in order: configured, last known-good, system default."""
+        try:
+            default_input = int(sd.default.device[0])
+        except Exception:
+            default_input = -1
+        order: list[int | None] = []
+        for candidate in (self._device_index, self._active_device, default_input, None):
+            if candidate is None:
+                if None not in order:
+                    order.append(None)
+                continue
+            if candidate >= 0 and candidate not in order:
+                order.append(candidate)
+        return order
+
+    @staticmethod
+    def _stream_options(sd, device: int | None) -> list[tuple[int, int]]:
+        """Channel/rate pairs to try for one device, native rate first."""
+        try:
+            info = sd.query_devices(device, "input")
+            native = int(float(info.get("default_samplerate") or SAMPLE_RATE))
+            max_channels = max(1, int(info.get("max_input_channels") or 1))
+        except Exception:
+            native, max_channels = SAMPLE_RATE, 1
+        options: list[tuple[int, int]] = []
+        for channels in dict.fromkeys((1, min(2, max_channels))):
+            for rate in dict.fromkeys((native, SAMPLE_RATE, 48000, 44100)):
+                if rate >= 8000:
+                    options.append((channels, rate))
+        return options
+
+    def _open_stream(self, notify: bool = True) -> bool:
         self._close_stream()
         try:
             import sounddevice as sd
 
-            device = self._device_index
-            # Use the microphone's native rate and resample to 16 kHz for
-            # Vosk.  Forcing 16 kHz on MME can silently capture distorted or
-            # empty audio on some Realtek and Bluetooth devices.
-            try:
-                default_input = sd.default.device[0]
-                info = sd.query_devices(device if device is not None else default_input, "input")
-                source_rate = int(info.get("default_samplerate") or SAMPLE_RATE)
-            except Exception:
-                source_rate = SAMPLE_RATE
-            try:
-                sd.check_input_settings(device=device, samplerate=source_rate, channels=1, dtype="int16")
-            except Exception:
-                source_rate = SAMPLE_RATE
-                try:
-                    sd.check_input_settings(device=device, samplerate=source_rate, channels=1, dtype="int16")
-                except Exception:
-                    pass
-            frames = int(source_rate * BLOCK_SECONDS)
-            stream = sd.RawInputStream(
-                samplerate=source_rate,
-                blocksize=frames,
-                dtype="int16",
-                channels=1,
-                device=device,
-                latency="low",
-            )
-            stream.start()
-            with self._stream_lock:
-                self._stream = stream
-            self._source_rate = source_rate
-            self._read_frames = frames
-            log.info("Microphone opened at %s Hz (device=%s).", source_rate, device)
-            return True
+            last_error: Exception | None = None
+            # A stale or unusable device index (virtual jacks, unplugged
+            # Bluetooth headsets) must not leave the assistant deaf.  Fall
+            # back to the last working device, then the system default.
+            for device in self._candidate_devices(sd):
+                for channels, source_rate in self._stream_options(sd, device):
+                    frames = int(source_rate * BLOCK_SECONDS)
+                    try:
+                        stream = sd.RawInputStream(
+                            samplerate=source_rate,
+                            blocksize=frames,
+                            dtype="int16",
+                            channels=channels,
+                            device=device,
+                            latency="low",
+                        )
+                        stream.start()
+                    except Exception as exc:
+                        last_error = exc
+                        continue
+                    with self._stream_lock:
+                        self._stream = stream
+                    self._source_rate = source_rate
+                    self._read_frames = frames
+                    self._active_device = device
+                    if device != self._device_index:
+                        log.warning(
+                            "Configured microphone %s would not open; using %s at %s Hz.",
+                            self._device_index,
+                            "the system default" if device is None else f"device {device}",
+                            source_rate,
+                        )
+                    log.info("Microphone opened at %s Hz (device=%s, channels=%s).", source_rate, device, channels)
+                    self._open_failures = 0
+                    return True
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("no usable input device was found")
         except Exception as exc:
             self._close_stream()
             log.warning("Microphone unavailable: %s", exc)
-            self._emit(self.engine.error,
-                       "Microphone unavailable. Check Windows microphone privacy settings and the selected input device.")
+            if notify:
+                self._emit(self.engine.error,
+                           "Microphone unavailable. Check Windows microphone privacy settings and the selected input device.")
             return False
 
     def _new_wake_recognizer(self):
@@ -201,6 +241,10 @@ class AudioWorker(threading.Thread):
             self._emit(self.engine.status_changed, "Listening")
         else:
             self._emit(self.engine.listening_changed, False)
+            if mode == "wake":
+                self._emit(self.engine.status_changed, "Listening")
+            elif mode == "idle":
+                self._emit(self.engine.status_changed, "Ready")
 
     def run(self) -> None:
         try:
@@ -236,8 +280,8 @@ class AudioWorker(threading.Thread):
                         self._wake_enabled = True
                         self._phrases = list(self.config.wake_phrases)
                         if self._mode != "command":
-                            if not self._open_stream():
-                                self._wake_enabled = False
+                            if not self._open_stream(notify=self._open_failures == 0):
+                                self._open_failures += 1
                                 continue
                             wake_recognizer = self._new_wake_recognizer()
                             self._set_mode("wake")
@@ -247,7 +291,8 @@ class AudioWorker(threading.Thread):
                             self._close_stream()
                             self._set_mode("idle")
                     elif command == "command":
-                        if self._stream is None and not self._open_stream():
+                        if self._stream is None and not self._open_stream(notify=self._open_failures == 0):
+                            self._open_failures += 1
                             continue
                         command_recognizer = self._new_command_recognizer()
                         self._set_mode("command")
@@ -255,8 +300,8 @@ class AudioWorker(threading.Thread):
                         if self._mode == "command":
                             self._close_stream()
                             if self._wake_enabled:
-                                if not self._open_stream():
-                                    self._wake_enabled = False
+                                if not self._open_stream(notify=self._open_failures == 0):
+                                    self._open_failures += 1
                                     self._set_mode("idle")
                                     continue
                                 wake_recognizer = self._new_wake_recognizer()
@@ -270,10 +315,11 @@ class AudioWorker(threading.Thread):
                     break
                 if self._stream is None:
                     if self._wake_enabled and self._mode != "command":
-                        if not self._open_stream():
-                            self._wake_enabled = False
-                            self._set_mode("idle")
-                            time.sleep(0.5)
+                        if not self._open_stream(notify=self._open_failures == 0):
+                            # A busy or unplugged device is often transient:
+                            # keep the wake word armed and retry with backoff.
+                            self._open_failures += 1
+                            time.sleep(min(15.0, 1.5 * self._open_failures))
                             continue
                         wake_recognizer = self._new_wake_recognizer()
                         self._set_mode("wake")
@@ -294,8 +340,10 @@ class AudioWorker(threading.Thread):
                     log.warning("Microphone read failed: %s", exc)
                     self._close_stream()
                     self._set_mode("idle")
-                    self._emit(self.engine.error, "The microphone stream stopped. I'll try again when you trigger me.")
-                    self._wake_enabled = False
+                    self._open_failures += 1
+                    if self._open_failures == 1:
+                        self._emit(self.engine.error, "The microphone stream stopped. Reconnecting…")
+                    time.sleep(min(10.0, 1.0 * self._open_failures))
                     continue
 
                 if overflowed:

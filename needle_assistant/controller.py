@@ -331,7 +331,7 @@ class AssistantController(QObject):
 
     def on_audio_status(self, status: str) -> None:
         log.info("Audio status: %s", status)
-        if status == "Ready":
+        if status in ("Ready", "Listening"):
             self._audio_error = ""
         self._refresh_settings_status()
 
