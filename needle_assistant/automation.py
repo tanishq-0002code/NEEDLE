@@ -778,78 +778,124 @@ class DesktopAutomation:
             self._click_uia(sub_target, restore_hwnd, button=btn, clicks=clicks_count)
             return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
         except AutomationError:
-            # Fallback: scan visible text on screen with OCR and click the match.
+            # Fallback: line-aware phrase matching over OCR words.
             try:
                 from .vision import ocr_words
                 import pyautogui
+
                 words = ocr_words(self._grab_screen_image())
-                tokens = [t for t in re.findall(r"[a-z0-9]+", sub_target.lower()) if t]
-                if not tokens:
-                    raise AutomationError(f"I couldn't find '{sub_target}' on the screen.")
 
                 def _norm(word: str) -> str:
-                    return re.sub(r"[^a-z0-9 ]", "", (word or "").lower()).strip()
+                    return re.sub(r"[^a-z0-9]+", " ", (word or "").lower()).strip()
 
-                # Group words by y coordinate-ish into lines.
-                rects: list[dict] = []
+                # Build line objects by clustering words whose y-centers are close.
+                items: list[dict] = []
                 for word in words:
                     text = _norm(str(word.get("text", "")))
                     if not text:
                         continue
                     try:
-                        rects.append({"text": text, "x": float(word["x"]), "y": float(word["y"]),
-                                      "w": float(word.get("width", 0)), "h": float(word.get("height", 0))})
+                        x = float(word.get("x", 0))
+                        y = float(word.get("y", 0))
+                        w = float(word.get("width", 0))
+                        h = float(word.get("height", 0))
                     except Exception:
                         continue
+                    items.append({"text": text, "x": x, "y": y, "w": w, "h": h, "yc": y + h / 2})
 
-                # Find the cleanest multi-word match.
-                best: dict | None = None
-                for start_word in rects:
-                    if tokens[0] not in start_word["text"] and start_word["text"] not in tokens[0]:
+                items.sort(key=lambda item: (item["yc"], item["x"]))
+                heights = sorted(item["h"] for item in items) or [12.0]
+                line_tolerance = max(10.0, heights[len(heights) // 2] * 1.8)
+
+                lines: list[list[dict]] = []
+                current: list[dict] = []
+                for item in items:
+                    if current and abs(item["yc"] - current[-1]["yc"]) > line_tolerance:
+                        lines.append(current)
+                        current = []
+                    current.append(item)
+                if current:
+                    lines.append(current)
+                for line in lines:
+                    line.sort(key=lambda item: item["x"])
+
+                target = _norm(sub_target)
+                target = re.sub(r"\s+", " ", target).strip()
+
+                # Exact line match: target is substring of a line.
+                best_rect: dict | None = None
+                for line in lines:
+                    line_text = " ".join(item["text"] for item in line)
+                    idx = line_text.find(target)
+                    if idx == -1:
                         continue
-                    line = [start_word]
-                    consumed = 1
-                    for needed_index in range(1, len(tokens)):
-                        need = tokens[needed_index]
-                        for candidate in rects:
-                            # same vertical band, to the right
-                            if abs(candidate["y"] - start_word["y"]) > 25:
-                                continue
-                            if candidate["x"] <= line[-1]["x"]:
-                                continue
-                            if candidate is line[-1]:
-                                continue
-                            cand = candidate.get("text", "")
-                            if need not in cand and cand not in need:
-                                continue
-                            line.append(candidate)
-                            consumed += 1
-                            break
-                        else:
-                            break
-                    if len(line) == len(tokens):
-                        xs = [item["x"] for item in line]
-                        xe = [item["x"] + item["w"] for item in line]
-                        ys = [item["y"] for item in line]
-                        ye = [item["y"] + item["h"] for item in line]
-                        candidate = {"x": min(xs), "y": min(ys), "w": max(xe) - min(xs), "h": max(ye) - min(ys), "count": len(line)}
-                        if best is None or candidate["count"] > best["count"]:
-                            best = candidate
+                    cursor = idx
+                    matched: list[dict] = []
+                    for i, item in enumerate(line):
+                        word_text = item["text"]
+                        start = cursor
+                        end = cursor + len(word_text)
+                        if end <= idx + len(target) and end >= idx:
+                            matched.append(item)
+                        cursor += len(word_text) + 1
+                    if len(matched) != len(target.split()):
+                        continue
+                    x0 = min(item["x"] for item in matched)
+                    y0 = min(item["y"] for item in matched)
+                    x1 = max(item["x"] + item["w"] for item in matched)
+                    y1 = max(item["y"] + item["h"] for item in matched)
+                    best_rect = {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+                    break
 
-                if best is None:
-                    # Fall back to a single matching word.
-                    for item in rects:
-                        if any(t in item["text"] for t in tokens):
-                            best = {"x": item["x"], "y": item["y"], "w": item["w"], "h": item["h"], "count": 1}
-                            break
+                if best_rect is not None:
+                    x = int(best_rect["x"] + best_rect["w"] // 2)
+                    y = int(best_rect["y"] + best_rect["h"] // 2)
+                    pyautogui.moveTo(x, y, duration=0.12)
+                    pyautogui.click(x, y, clicks=clicks_count, button=btn)
+                    return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
 
-                if best is None:
-                    raise AutomationError(f"I couldn't find '{sub_target}' on the screen.")
-                x = int(best["x"] + best["w"] // 2)
-                y = int(best["y"] + best["h"] // 2)
-                pyautogui.moveTo(x, y, duration=0.12)
-                pyautogui.click(x, y, clicks=clicks_count, button=btn)
-                return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
+                # 2) Fallback: nearest matching line (partially tokenized).
+                target_tokens = target.split()
+                if target_tokens:
+                    from difflib import SequenceMatcher
+
+                    def _token_present(token: str, line_words: list[str]) -> bool:
+                        t = token.lower()
+                        for w in line_words:
+                            wl = w.lower()
+                            if t == wl:
+                                return True
+                            if t in wl or wl in t:
+                                return True
+                            if len(t) >= 4 and len(wl) >= 4:
+                                if SequenceMatcher(None, t, wl).ratio() > 0.75:
+                                    return True
+                        return False
+
+                    best_line = None
+                    best_score = -1.0
+                    for line in lines:
+                        line_words = [item["text"] for item in line]
+                        if not line_words:
+                            continue
+                        matched = sum(1 for token in target_tokens if _token_present(token, line_words))
+                        score = matched / len(target_tokens)
+                        if score > best_score:
+                            best_score = score
+                            best_line = (line, matched, len(target_tokens))
+                    if best_line and best_score >= 0.5:
+                        line, matched, total = best_line
+                        x0 = min(item["x"] for item in line)
+                        y0 = min(item["y"] for item in line)
+                        x1 = max(item["x"] + item["w"] for item in line)
+                        y1 = max(item["y"] + item["h"] for item in line)
+                        x = int(x0 + (x1 - x0) // 2)
+                        y = int(y0 + (y1 - y0) // 2)
+                        pyautogui.moveTo(x, y, duration=0.12)
+                        pyautogui.click(x, y, clicks=clicks_count, button=btn)
+                        return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
+
+                raise AutomationError(f"I couldn't find '{sub_target}' on the screen.")
             except Exception as exc:
                 raise AutomationError(f"I couldn't find '{sub_target}' on the screen.") from exc
 
