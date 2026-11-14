@@ -1,9 +1,38 @@
 from __future__ import annotations
 
 import io
+import threading
 from typing import Any
 
 from PIL import Image
+
+
+def _with_mta(fn):
+    """Run a WinRT function in MTA mode without blocking STA."""
+    import winrt.runtime as _rt
+
+    result: list[Any] = []
+    error: list[BaseException] = []
+
+    def _run():
+        try:
+            _rt.init_apartment(_rt.MTA)
+            try:
+                result.append(fn())
+            finally:
+                try:
+                    _rt.uninit_apartment()
+                except Exception:
+                    pass
+        except BaseException as exc:
+            error.append(exc)
+
+    thread = threading.Thread(target=_run, name="WinRT-OCR", daemon=True)
+    thread.start()
+    thread.join()
+    if error:
+        raise error[0]
+    return result[0] if result else None
 
 
 def _winrt_ocr(image: Image.Image) -> str:
@@ -109,7 +138,7 @@ def _winrt_ocr_words(image: Image.Image) -> list[dict[str, Any]]:
 def ocr_words(image: Any) -> list[dict[str, Any]]:
     if not isinstance(image, Image.Image):
         raise TypeError("ocr_words expects a PIL.Image.Image")
-    return _winrt_ocr_words(image)
+    return list(_with_mta(lambda: _winrt_ocr_words(image)) or [])
 
 
 def ocr_image(image: Any) -> str:
@@ -117,8 +146,8 @@ def ocr_image(image: Any) -> str:
     if not isinstance(image, Image.Image):
         raise TypeError("ocr_image expects a PIL.Image.Image")
     try:
-        return _winrt_ocr(image)
-    except Exception as exc:  # pragma: no cover - exercised on real Windows
+        return str(_with_mta(lambda: _winrt_ocr(image)) or "")
+    except Exception as exc:
         raise RuntimeError(f"Windows OCR failed: {exc}") from exc
 
 
