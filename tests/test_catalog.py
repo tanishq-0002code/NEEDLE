@@ -61,22 +61,51 @@ class FastRouteTests(unittest.TestCase):
         self.assertEqual(call.name, "click_element")
         self.assertEqual(call.arguments["target"], "save")
 
+    def test_close_application(self) -> None:
+        call = fast_route("close Chrome")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "close_application")
+        self.assertEqual(call.arguments["app_name"], "Chrome")
+
+    def test_system_control(self) -> None:
+        call = fast_route("shut down the computer")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "system_control")
+        self.assertEqual(call.arguments["action"], "shutdown")
+
+    def test_focus_window(self) -> None:
+        call = fast_route("switch to Notepad")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "focus_window")
+        self.assertEqual(call.arguments["title"], "Notepad")
+
+    def test_window_manage(self) -> None:
+        call = fast_route("minimize Notepad")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "window_manage")
+        self.assertEqual(call.arguments["action"], "minimize")
+        self.assertEqual(call.arguments["title"], "Notepad")
+
     def test_unknown_is_left_to_needle(self) -> None:
         self.assertIsNone(fast_route("what is the weather tomorrow"))
 
 
 class CatalogTests(unittest.TestCase):
-    def test_six_tools_are_declared(self) -> None:
-        self.assertEqual(len(TOOL_SCHEMAS), 6)
+    def test_ten_tools_are_declared(self) -> None:
+        self.assertEqual(len(TOOL_SCHEMAS), 10)
         self.assertEqual(
             ALLOWED_TOOLS,
             {
                 "open_application",
+                "close_application",
                 "type_text",
                 "click_element",
+                "focus_window",
+                "window_manage",
                 "press_hotkey",
                 "take_screenshot",
                 "control_media",
+                "system_control",
             },
         )
 
@@ -121,6 +150,43 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNotNone(call)
         self.assertIn("OPEN APPLICATION", badge_text(call))
         self.assertIn("notepad", badge_text(call))
+
+    def test_close_validation(self) -> None:
+        name, arguments = validate_call("close_application", {"app_name": "Chrome"})
+        self.assertEqual(name, "close_application")
+        self.assertEqual(arguments["app_name"], "Chrome")
+        self.assertFalse(arguments.get("force"))
+
+    def test_system_control_validation(self) -> None:
+        name, arguments = validate_call("system_control", {"action": "lock"})
+        self.assertEqual(name, "system_control")
+        self.assertEqual(arguments["action"], "lock")
+        # Repair from user text.
+        name, arguments = validate_call("system_control", {}, "shut down the computer")
+        self.assertEqual(arguments["action"], "shutdown")
+
+    def test_window_manage_validation(self) -> None:
+        name, arguments = validate_call(
+            "window_manage", {"title": "Notepad", "action": "minimise"}
+        )
+        self.assertEqual(arguments["title"], "Notepad")
+        self.assertEqual(arguments["action"], "minimize")
+
+    def test_targeted_type_window(self) -> None:
+        name, arguments = validate_call(
+            "type_text", {"text": "hello", "window": "Notepad"}
+        )
+        self.assertEqual(arguments["text"], "hello")
+        self.assertEqual(arguments["window"], "Notepad")
+
+    def test_destructive_helpers(self) -> None:
+        from needle_assistant.catalog import is_destructive, destructive_description
+
+        call = fast_route("shut down the computer")
+        self.assertTrue(is_destructive(call))
+        self.assertIn("shut down", destructive_description(call).lower())
+        call = fast_route("close Chrome")
+        self.assertFalse(is_destructive(call))
 
 
 class EnvelopeTests(unittest.TestCase):

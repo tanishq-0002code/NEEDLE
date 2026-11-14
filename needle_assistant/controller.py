@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import replace
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QApplication, QInputDialog
+from PyQt6.QtWidgets import QApplication, QInputDialog, QMessageBox
 
 from . import __app_name__, __version__
+from .audit import record as audit_record
 from .audio import AudioEngine, list_input_devices
-from .automation import DesktopAutomation
-from .catalog import fast_route
+from .automation import AmbiguousAppError, AutomationError, DesktopAutomation
+from .catalog import destructive_description, fast_route, is_destructive
+from .confirmation import ConfirmationStore
 from .config import AppConfig, load_config, save_config
 from .hotkey import HotkeyManager, OutsideClickWatcher
 from .models import ExecutionResult, ToolCall
@@ -35,6 +38,7 @@ class AssistantController(QObject):
     status_changed = pyqtSignal(str)
     config_changed = pyqtSignal(object)
     refresh_status = pyqtSignal()
+    confirm_needed = pyqtSignal(str, object, object)
 
     def __init__(self, app: QApplication, config: AppConfig) -> None:
         super().__init__()
@@ -53,6 +57,7 @@ class AssistantController(QObject):
         self.overlay.toggle_enabled_requested.connect(lambda: self.toggle_enabled(not self.enabled))
         self.overlay.reset_perch_requested.connect(self.overlay.reset_perch)
         self.overlay.quit_requested.connect(self.quit)
+        self.overlay.command_submitted.connect(self.process_text)
         self.audio = AudioEngine(config)
         self.hotkey = HotkeyManager()
         self.outside = OutsideClickWatcher()
@@ -69,6 +74,8 @@ class AssistantController(QObject):
         self._audio_error = ""
         self._telegram_status = "Off"
         self._telegram_token = ""
+        self._confirmation_store = ConfirmationStore()
+        self._pending_clarification: dict | None = None
 
         self.hotkey.activated.connect(self.toggle_from_hotkey)
         self.hotkey.escape_pressed.connect(self.on_escape)
@@ -90,6 +97,7 @@ class AssistantController(QObject):
         self.route_failed.connect(self.on_route_failed)
         self.execution_ready.connect(self.on_execution_ready)
         self.refresh_status.connect(self._refresh_settings_status)
+        self.confirm_needed.connect(self._on_confirm_needed)
 
     # ------------------------------------------------------------------ startup
     def start(self) -> None:
@@ -205,6 +213,8 @@ class AssistantController(QObject):
             self.overlay.show_error("I didn't hear a command.")
             self.overlay.hide_after(2200)
             return
+        if self._take_clarification(text):
+            return
         self._active = True
         self._session += 1
         session = self._session
@@ -222,10 +232,104 @@ class AssistantController(QObject):
             call = self.router.route(text, use_fast=self.config.fast_intent)
             if call.name and not call.user_text:
                 call.user_text = text
+            if call.name:
+                problem = self._check_app_resolution(call)
+                if problem is not None:
+                    self.route_failed.emit(problem, session)
+                    return
+                confidence = call.confidence
+                if (
+                    call.source not in ("fast", "cache")
+                    and confidence is not None
+                    and confidence < 0.60
+                ):
+                    message = call.reasoning or (
+                        "I'm not sure what you mean. Try rephrasing that."
+                    )
+                    log.info("Low-confidence route discarded (%.2f): %s", confidence, message)
+                    self.route_failed.emit(message, session)
+                    return
             self.route_ready.emit(call, session)
         except Exception as exc:
             log.exception("Route worker failed.")
             self.route_failed.emit(str(exc), session)
+
+    def _check_app_resolution(self, call: ToolCall) -> str | None:
+        """Fail early with a clarification when an app name is ambiguous."""
+        if call.name not in {"open_application", "close_application"}:
+            return None
+        raw = str(call.arguments.get("app_name", ""))
+        if not raw:
+            return None
+        try:
+            self.automation._resolver.resolve(raw)  # noqa: SLF001 - pre-flight check
+        except AmbiguousAppError as exc:
+            candidates = list(exc.candidates)
+            self._pending_clarification = {
+                "kind": "app",
+                "tool": call.name,
+                "candidates": candidates,
+                "created": time.monotonic(),
+                "text": call.user_text or "",
+            }
+            return str(exc)
+        except AutomationError as exc:
+            return str(exc)
+        return None
+
+    @staticmethod
+    def _match_candidate(text: str, candidates: list[str]) -> str | None:
+        tokens = re.findall(r"[a-z0-9]+", text.lower())
+        ordinal_tokens = [
+            ("first", 0), ("1st", 0), ("second", 1), ("2nd", 1), ("third", 2),
+            ("3rd", 2), ("fourth", 3), ("fifth", 4),
+            ("one", 0), ("two", 1), ("three", 2), ("four", 3), ("five", 4),
+            ("1", 0), ("2", 1), ("3", 2), ("4", 3), ("5", 4),
+        ]
+        for token, index in ordinal_tokens:
+            if token in tokens and 0 <= index < len(candidates):
+                return candidates[index]
+        cleaned = " ".join(tokens)
+        for candidate in candidates:
+            lowered = candidate.lower()
+            if lowered in cleaned or cleaned in lowered:
+                return candidate
+        return None
+
+    def _take_clarification(self, text: str) -> bool:
+        pending = self._pending_clarification
+        if not pending:
+            return False
+        self._pending_clarification = None
+        if time.monotonic() - float(pending.get("created", 0)) > 90:
+            return False
+        candidates = [str(item) for item in pending.get("candidates", [])]
+        if not candidates:
+            return False
+        choice = self._match_candidate(text, candidates)
+        if choice is None:
+            log.info("Clarification answer did not match; treating as a new command.")
+            return False
+        tool = str(pending.get("tool") or "open_application")
+        original = str(pending.get("text") or "")
+        call = ToolCall(
+            name=tool,
+            arguments={"app_name": choice},
+            source="clarified",
+            confidence=1.0,
+            user_text=f"{original} (clarified: {choice})".strip(),
+        )
+        self._active = True
+        self._session += 1
+        session = self._session
+        self.overlay.set_thinking(original or f"open {choice}")
+        interactive = tool in INTERACTIVE_TOOLS
+        restore = self._foreground_hwnd if interactive else 0
+        if interactive:
+            QTimer.singleShot(120, lambda: self._run_execution(call, restore, session))
+        else:
+            self._run_execution(call, restore, session)
+        return True
 
     def on_route_ready(self, call: ToolCall, session: int) -> None:
         if session != self._session or not self.overlay.isVisible():
@@ -270,7 +374,19 @@ class AssistantController(QObject):
     def _execution_worker(self, call: ToolCall, restore_hwnd: int, session: int) -> None:
         started = time.monotonic()
         try:
-            result = self.automation.execute(call, restore_hwnd=restore_hwnd)
+            if call.name == "system_control" and not self.config.allow_power_actions:
+                result = ExecutionResult(
+                    False, "Power actions are disabled in Settings.", call.name or ""
+                )
+            elif is_destructive(call) and self.config.confirm_destructive:
+                if not self._confirm_local(destructive_description(call)):
+                    result = ExecutionResult(
+                        False, "Cancelled — no changes were made.", call.name or ""
+                    )
+                else:
+                    result = self.automation.execute(call, restore_hwnd=restore_hwnd)
+            else:
+                result = self.automation.execute(call, restore_hwnd=restore_hwnd)
         except Exception as exc:
             log.exception("Automation worker crashed.")
             result = ExecutionResult(False, f"The action failed: {exc}", call.name or "")
@@ -279,6 +395,62 @@ class AssistantController(QObject):
             call.name, time.monotonic() - started, result.success,
         )
         self.execution_ready.emit(result, call, session)
+
+    # ------------------------------------------------------------------ confirmation
+    def _confirm_local(self, description: str) -> bool:
+        """Ask on the PC before a destructive action. Safe from worker threads."""
+        if threading.current_thread() is threading.main_thread():
+            return self._show_confirmation_dialog(description)
+        done = threading.Event()
+        outcome = [False]
+        try:
+            self.confirm_needed.emit(description, done, outcome)
+        except Exception:
+            return False
+        done.wait(30.0)
+        return bool(outcome[0])
+
+    def _on_confirm_needed(self, description: str, done: object, outcome: list) -> None:
+        accepted = self._show_confirmation_dialog(str(description))
+        try:
+            outcome[0] = accepted
+        except Exception:
+            pass
+        event = done
+        if isinstance(event, threading.Event):
+            event.set()
+
+    def _show_confirmation_dialog(self, description: str) -> bool:
+        try:
+            box = QMessageBox(self.overlay)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Needle Desktop — confirm")
+            box.setText(f"{description}?")
+            box.setInformativeText(
+                "This can be disruptive. Only continue if you really meant it."
+            )
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            box.setDefaultButton(QMessageBox.StandardButton.No)
+            yes_button = box.button(QMessageBox.StandardButton.Yes)
+            no_button = box.button(QMessageBox.StandardButton.No)
+            if yes_button:
+                yes_button.setText("Do it")
+            if no_button:
+                no_button.setText("Cancel")
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: box.reject())
+            timer.start(20000)
+            try:
+                answer = box.exec()
+            finally:
+                timer.stop()
+            return answer == QMessageBox.StandardButton.Yes
+        except Exception:
+            log.debug("Could not show the confirmation dialog.", exc_info=True)
+            return False
 
     def on_execution_ready(self, result: ExecutionResult, call: ToolCall, session: int) -> None:
         if session != self._session:
@@ -289,6 +461,10 @@ class AssistantController(QObject):
         self._play_sound("done.wav" if result.success else "error.wav")
         if not result.success:
             self.notify.emit("Needle couldn't finish", result.message)
+        try:
+            audit_record(call.name or "", getattr(call, "arguments", {}), result.success, result.message)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ dismiss
     def dismiss(self) -> None:
@@ -520,11 +696,21 @@ class AssistantController(QObject):
             allowed_chat_ids=self.config.telegram_allowed_chat_ids,
             handler=self._execute_telegram_command,
             status_provider=self._telegram_status_text,
+            on_pair=self._on_telegram_paired,
         )
         self.telegram = bot
         self._telegram_token = token
         bot.status_changed.connect(self.on_telegram_status)
         bot.start()
+
+    def _on_telegram_paired(self, chat_id: int) -> None:
+        if chat_id not in self.config.telegram_allowed_chat_ids:
+            self.config.telegram_allowed_chat_ids.append(chat_id)
+            save_config(self.config)
+            log.info("Persisted auto-paired Telegram chat ID %s to config.", chat_id)
+            if self.settings is not None:
+                self.settings.config = self.config
+                self.settings.telegram_ids_edit.setText(", ".join(str(c) for c in self.config.telegram_allowed_chat_ids))
 
     def _stop_telegram(self, status: str = "Off") -> None:
         bot = self.telegram
@@ -573,6 +759,23 @@ class AssistantController(QObject):
             f"Telegram: {self._telegram_status}"
         )
 
+    def _classify_for_telegram(self, text: str) -> ToolCall | None:
+        try:
+            call = self.router.route(text, use_fast=self.config.fast_intent)
+            if call.name and not call.user_text:
+                call.user_text = text
+            return call
+        except Exception:
+            log.debug("Telegram classification failed.", exc_info=True)
+            return None
+
+    def _confirmation_required_for_telegram(self, call: ToolCall) -> bool:
+        if call is None or not call.name:
+            return False
+        if not self.config.confirm_destructive:
+            return False
+        return is_destructive(call)
+
     def _execute_telegram_command(self, text: str) -> tuple[ToolCall, ExecutionResult]:
         text = " ".join((text or "").split())
         if not text:
@@ -610,7 +813,9 @@ class AssistantController(QObject):
         if not call.name:
             message = call.error or call.reasoning or "I couldn't map that to a desktop action."
             return call, ExecutionResult(False, message, call.name or "")
-
+        if call.name == "system_control" and not self.config.allow_power_actions:
+            message = "Power actions are disabled in Settings."
+            return call, ExecutionResult(False, message, call.name or "")
         if self.config.log_transcripts:
             log.info("Telegram command: %r -> %s", text, call.name)
         else:

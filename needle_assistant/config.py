@@ -111,6 +111,8 @@ class AppConfig:
     wake_word_enabled: bool = True
     wake_phrases: list[str] = field(default_factory=lambda: list(DEFAULT_WAKE_PHRASES))
     microphone_index: int | None = None
+    mic_gain: float = 3.0
+    mic_energy_threshold: float = 0.012
     start_with_windows: bool = False
     fast_intent: bool = True
     max_new_tokens: int = 128
@@ -121,6 +123,8 @@ class AppConfig:
     show_on_start: bool = True
     first_run_done: bool = False
     log_transcripts: bool = False
+    confirm_destructive: bool = True
+    allow_power_actions: bool = True
     telegram_enabled: bool = False
     telegram_bot_token: str = ""
     telegram_allowed_chat_ids: list[int] = field(default_factory=list)
@@ -131,6 +135,8 @@ class AppConfig:
         if self.wake_word_enabled and not self.wake_phrases:
             self.wake_phrases = list(DEFAULT_WAKE_PHRASES)
         self.telegram_enabled = bool(self.telegram_enabled)
+        self.confirm_destructive = bool(self.confirm_destructive)
+        self.allow_power_actions = bool(self.allow_power_actions)
         self.telegram_bot_token = str(self.telegram_bot_token or "").strip()[:512]
         self.telegram_allowed_chat_ids = normalize_chat_ids(self.telegram_allowed_chat_ids)
         if self.microphone_index is not None:
@@ -140,6 +146,14 @@ class AppConfig:
                 self.microphone_index = None
             if self.microphone_index is not None and self.microphone_index < 0:
                 self.microphone_index = None
+        try:
+            self.mic_gain = max(1.0, min(10.0, float(self.mic_gain)))
+        except (TypeError, ValueError):
+            self.mic_gain = 3.0
+        try:
+            self.mic_energy_threshold = max(0.003, min(0.10, float(self.mic_energy_threshold)))
+        except (TypeError, ValueError):
+            self.mic_energy_threshold = 0.012
         self.max_new_tokens = max(32, min(512, int(self.max_new_tokens)))
         self.threads = max(0, min(64, int(self.threads)))
         self.overlay_width = max(520, min(1000, int(self.overlay_width)))

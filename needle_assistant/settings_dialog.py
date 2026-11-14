@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -90,6 +91,7 @@ class SettingsDialog(QDialog):
         content_layout.addWidget(self._build_how_to())
         content_layout.addWidget(self._build_status())
         content_layout.addWidget(self._build_controls())
+        content_layout.addWidget(self._build_capabilities())
         content_layout.addWidget(self._build_telegram())
         content_layout.addStretch(1)
         scroll.setWidget(content)
@@ -225,36 +227,82 @@ class SettingsDialog(QDialog):
             self.mic_combo.addItem(label, index)
         grid.addWidget(self.mic_combo, 3, 1)
 
-        grid.addWidget(self._label("Routing"), 4, 0)
+        grid.addWidget(self._label("Mic Boost / Gain"), 4, 0)
+        gain_row = QHBoxLayout()
+        self.mic_gain_spin = QDoubleSpinBox(card)
+        self.mic_gain_spin.setRange(1.0, 10.0)
+        self.mic_gain_spin.setSingleStep(0.5)
+        self.mic_gain_spin.setDecimals(1)
+        self.mic_gain_spin.setSuffix("x")
+        self.mic_gain_spin.setToolTip("Software amplification boost for quiet or inaudible microphones.")
+        gain_row.addWidget(self.mic_gain_spin, 0)
+        gain_hint = QLabel("(Boosts low-volume mics; 2.5x - 5.0x recommended if voice is faint)", card)
+        gain_hint.setStyleSheet("color: #64748B; font-size: 11px;")
+        gain_row.addWidget(gain_hint, 1)
+        grid.addLayout(gain_row, 4, 1)
+
+        grid.addWidget(self._label("Routing"), 5, 0)
         self.fast_check = QCheckBox("Use the instant fast route for simple commands (Needle 3 handles everything else)", card)
-        grid.addWidget(self.fast_check, 4, 1)
+        grid.addWidget(self.fast_check, 5, 1)
 
-        grid.addWidget(self._label("Appearance"), 5, 0)
+        grid.addWidget(self._label("Appearance"), 6, 0)
         self.acrylic_check = QCheckBox("Use Windows acrylic blur behind the glass popup", card)
-        grid.addWidget(self.acrylic_check, 5, 1)
+        grid.addWidget(self.acrylic_check, 6, 1)
 
-        grid.addWidget(self._label("Startup"), 6, 0)
+        grid.addWidget(self._label("Startup"), 7, 0)
         self.startup_check = QCheckBox("Start Needle Desktop with Windows", card)
-        grid.addWidget(self.startup_check, 6, 1)
+        grid.addWidget(self.startup_check, 7, 1)
 
-        grid.addWidget(self._label("First launch"), 7, 0)
+        grid.addWidget(self._label("First launch"), 8, 0)
         self.show_on_start_check = QCheckBox("Show a tray hint when the app starts", card)
-        grid.addWidget(self.show_on_start_check, 7, 1)
+        grid.addWidget(self.show_on_start_check, 8, 1)
 
-        grid.addWidget(self._label("Needle output limit"), 8, 0)
+        grid.addWidget(self._label("Needle output limit"), 9, 0)
         self.tokens_spin = QSpinBox(card)
         self.tokens_spin.setRange(32, 512)
         self.tokens_spin.setSingleStep(16)
         self.tokens_spin.setToolTip("Lower values finish faster. 128 is recommended on a 2-core CPU.")
-        grid.addWidget(self.tokens_spin, 8, 1)
+        grid.addWidget(self.tokens_spin, 9, 1)
 
-        grid.addWidget(self._label("Enable Needle"), 9, 0)
+        grid.addWidget(self._label("Enable Needle"), 10, 0)
         self.enable_check = QCheckBox(
             "Enable Needle Desktop (listening, hotkey, wake word, and Telegram)",
             card,
         )
-        grid.addWidget(self.enable_check, 9, 1)
+        grid.addWidget(self.enable_check, 10, 1)
         layout.addLayout(grid)
+        return card
+
+    def _build_capabilities(self) -> QFrame:
+        card, layout = self._card(
+            "Capabilities",
+            "Extra desktop powers. Destructive actions always ask for confirmation before running.",
+        )
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(9)
+        grid.setColumnStretch(1, 1)
+
+        self.confirm_destructive_check = QCheckBox(
+            "Ask before closing apps, shutting down, deleting, or running shell commands",
+            card,
+        )
+        grid.addWidget(self.confirm_destructive_check, 0, 1)
+        self.allow_power_actions_check = QCheckBox(
+            "Allow power actions (lock, shutdown, restart, sleep, hibernate)",
+            card,
+        )
+        grid.addWidget(self.allow_power_actions_check, 1, 1)
+        layout.addLayout(grid)
+        hint = QLabel(
+            "Lock works without a confirmation. Shutdown, restart, sleep and hibernate "
+            "always prompt, even when this toggle is on. Telegram approval requires "
+            "replying /confirm in the paired chat.",
+            card,
+        )
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
         return card
 
     def _build_telegram(self) -> QFrame:
@@ -320,7 +368,14 @@ class SettingsDialog(QDialog):
         self.phrases_edit.setText(", ".join(config.wake_phrases))
         index = self.mic_combo.findData(config.microphone_index)
         self.mic_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.mic_gain_spin.setValue(float(getattr(config, "mic_gain", 3.0) or 3.0))
         self.fast_check.setChecked(config.fast_intent)
+        self.confirm_destructive_check.setChecked(
+            bool(getattr(config, "confirm_destructive", True))
+        )
+        self.allow_power_actions_check.setChecked(
+            bool(getattr(config, "allow_power_actions", True))
+        )
         self.acrylic_check.setChecked(config.acrylic_blur)
         self.startup_check.setChecked(windows_api.is_start_with_windows() or config.start_with_windows)
         self.show_on_start_check.setChecked(config.show_on_start)
@@ -427,7 +482,10 @@ class SettingsDialog(QDialog):
         updated.enabled = self.enable_check.isChecked()
         updated.wake_phrases = phrases or updated.wake_phrases
         updated.microphone_index = self.mic_combo.currentData()
+        updated.mic_gain = self.mic_gain_spin.value()
         updated.fast_intent = self.fast_check.isChecked()
+        updated.confirm_destructive = self.confirm_destructive_check.isChecked()
+        updated.allow_power_actions = self.allow_power_actions_check.isChecked()
         updated.acrylic_blur = self.acrylic_check.isChecked()
         updated.start_with_windows = self.startup_check.isChecked()
         updated.show_on_start = self.show_on_start_check.isChecked()

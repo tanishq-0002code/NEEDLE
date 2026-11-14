@@ -18,12 +18,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "close_application",
+        "description": "Close or quit an application that is already running",
+        "triggers": [r"^(?:please\s+)?(?:close|quit|exit)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {"type": "string"},
+                "force": {"type": "boolean"},
+            },
+            "required": ["app_name"],
+        },
+    },
+    {
         "name": "type_text",
         "description": "Type text",
         "triggers": [r"^(?:please\s+)?(?:type|write|enter|dictate)\b"],
         "parameters": {
             "type": "object",
-            "properties": {"text": {"type": "string"}},
+            "properties": {
+                "text": {"type": "string"},
+                "window": {"type": "string"},
+            },
             "required": ["text"],
         },
     },
@@ -33,8 +49,52 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "triggers": [r"^(?:please\s+)?(?:click|tap)\b"],
         "parameters": {
             "type": "object",
-            "properties": {"target": {"type": "string"}},
+            "properties": {
+                "target": {"type": "string"},
+                "window": {"type": "string"},
+            },
             "required": ["target"],
+        },
+    },
+    {
+        "name": "focus_window",
+        "description": "Bring a specific window to the front by its title",
+        "triggers": [r"^(?:please\s+)?(?:switch to|focus|bring up|go to)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+        },
+    },
+    {
+        "name": "window_manage",
+        "description": "Minimize, maximize, or restore a window",
+        "triggers": [r"^(?:please\s+)?(?:minimi[sz]e|maximi[sz]e|restore|unmini[sz]e)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "action": {"type": "string", "enum": ["minimize", "maximize", "restore"]},
+            },
+            "required": ["title", "action"],
+        },
+    },
+    {
+        "name": "system_control",
+        "description": "Lock, shut down, restart, sleep, or hibernate the PC",
+        "triggers": [
+            r"\b(?:shut\s*down|shutdown|turn\s*off|power\s*off|restart|reboot|"
+            r"sleep|hibernate|lock)\b"
+        ],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["lock", "shutdown", "restart", "sleep", "hibernate"],
+                }
+            },
+            "required": ["action"],
         },
     },
     {
@@ -126,8 +186,51 @@ _MEDIA_RE = re.compile(
     re.I,
 )
 _SCREENSHOT_RE = re.compile(
-    r"^(?:please\s+)?(?:take|grab|capture)?\s*(?:a\s+)?screenshot"
+    r"^(?:please\s+)?(?:(?:take|grab|capture)?\s*(?:a\s+)?screenshot"
+    r"|(?:see|look at|view|show|inspect)\s+(?:my\s+|the\s+)?(?:screen|display|desktop)"
+    r"|what(?:'s|\s+is)\s+on\s+(?:my\s+|the\s+)?(?:screen|display|desktop)"
+    r"|capture\s+(?:the\s+)?(?:screen|display|desktop))"
     r"(?:\s+of\s+(?:the\s+)?(?:screen|display|desktop))?[.!?]*$",
+    re.I,
+)
+_CURSOR_MOVE_RE = re.compile(
+    r"^(?:please\s+)?(?:move\s+(?:the\s+)?(?:cursor|mouse)\s+(?:to\s+)?|hover\s+(?:over\s+)?)(.+?)[.!?]*$",
+    re.I,
+)
+_RIGHT_CLICK_RE = re.compile(
+    r"^(?:please\s+)?(?:right[\s-]click|do\s+a\s+right[\s-]click)(?:\s+(?:(?:on|at)\s+)?(.+?))?[.!?]*$",
+    re.I,
+)
+_DOUBLE_CLICK_RE = re.compile(
+    r"^(?:please\s+)?(?:double[\s-]click|do\s+a\s+double[\s-]click)(?:\s+(?:(?:on|at)\s+)?(.+?))?[.!?]*$",
+    re.I,
+)
+_SCROLL_RE = re.compile(
+    r"^(?:please\s+)?scroll\s+(up|down)(?:\s+(\d+))?[.!?]*$",
+    re.I,
+)
+_CLOSE_RE = re.compile(
+    r"^(?:please\s+)?(?:close|quit|exit)\s+(.+?)[.!?]*$",
+    re.I,
+)
+_FOCUS_RE = re.compile(
+    r"^(?:please\s+)?(?:switch to|focus(?:\s+on)?|bring up|go to)\s+(.+?)[.!?]*$",
+    re.I,
+)
+_WINDOW_MANAGE_RE = re.compile(
+    r"^(?:please\s+)?(minimi[sz]e|maximi[sz]e|restore|unmini[sz]e)\s+(.+?)[.!?]*$",
+    re.I,
+)
+_SYSTEM_VERB = r"(shut\s*down|shutdown|turn\s*off|power\s*off|restart|reboot|sleep|hibernate|lock)"
+_SYSTEM_RE = re.compile(
+    rf"^(?:please\s+)?{_SYSTEM_VERB}(?:\s+(?:my|the))?"
+    rf"(?:\s+(?:computer|pc|machine|laptop|screen|display))?[.!?]*$",
+    re.I,
+)
+_SLEEP_RE = re.compile(
+    r"^(?:please\s+)?(?:put\s+(?:the\s+)?(?:computer|pc|machine|laptop)\s+to\s+sleep"
+    r"|sleep(?:\s+(?:the\s+)?(?:computer|pc|machine|laptop))?"
+    r"|go\s+to\s+sleep)[.!?]*$",
     re.I,
 )
 
@@ -236,6 +339,81 @@ def _clean_click_target(value: str) -> str:
     return target.strip()
 
 
+_GENERIC_WINDOW_TARGETS = {"window", "it", "this", "that", "app", "current window"}
+_SYSTEM_VERBS = {
+    "shut down": "shutdown",
+    "shutdown": "shutdown",
+    "turn off": "shutdown",
+    "power off": "shutdown",
+    "restart": "restart",
+    "reboot": "restart",
+    "lock": "lock",
+    "sleep": "sleep",
+    "hibernate": "hibernate",
+}
+_SYSTEM_ACTIONS = frozenset(_SYSTEM_VERBS.values())
+_WINDOW_ACTIONS = {
+    "minimize": "minimize",
+    "minimise": "minimize",
+    "maximize": "maximize",
+    "maximise": "maximize",
+    "restore": "restore",
+    "unminimize": "restore",
+    "unminimise": "restore",
+}
+
+
+def _clean_window_title(value: str) -> str:
+    title = _compact(value).strip("\"'`")
+    title = re.sub(r"^(?:the|my)\s+", "", title, flags=re.I)
+    title = re.sub(r"\s+(?:window|app|application)$", "", title, flags=re.I)
+    return title.strip()
+
+
+def normalize_system_action(value: Any, user_text: str = "") -> str:
+    raw = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if raw in _SYSTEM_VERBS:
+        return _SYSTEM_VERBS[raw]
+    if user_text:
+        match = _SYSTEM_RE.fullmatch(_strip_polite(user_text))
+        if match:
+            verb = re.sub(r"\s+", " ", match.group(1).lower())
+            return _SYSTEM_VERBS.get(verb, "")
+    return ""
+
+
+def normalize_window_action(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return _WINDOW_ACTIONS.get(raw, "")
+
+
+def _close_app_from_request(text: str) -> str | None:
+    match = _CLOSE_RE.fullmatch(_strip_polite_keepcase(text))
+    if not match:
+        return None
+    name = _clean_app_name(match.group(1))
+    return name or None
+
+
+def _window_manage_from_request(text: str) -> tuple[str, str] | None:
+    match = _WINDOW_MANAGE_RE.fullmatch(_strip_polite_keepcase(text))
+    if not match:
+        return None
+    action = normalize_window_action(match.group(1))
+    title = _clean_window_title(match.group(2))
+    if not action or not title:
+        return None
+    return action, title
+
+
+def _focus_from_request(text: str) -> str | None:
+    match = _FOCUS_RE.fullmatch(_strip_polite_keepcase(text))
+    if not match:
+        return None
+    title = _clean_window_title(match.group(1))
+    return title or None
+
+
 def _hotkey_from_text(text: str) -> list[str] | None:
     cleaned = _strip_polite(text)
     phrase = re.sub(r"\s+(this|that|it|the file|the document|the page|the window)$", "", cleaned)
@@ -324,14 +502,78 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
             raise ValueError("There is no text to type.")
         if "\x00" in text:
             raise ValueError("The text contains an invalid character.")
-        return name, {"text": text[:5000]}
+        window = _clean_window_title(arguments.get("window")) or ""
+        result = {"text": text[:5000]}
+        if window:
+            result["window"] = window[:200]
+        return name, result
     if name == "click_element":
         target = _clean_click_target(str(arguments.get("target", "")))
         if not target:
             raise ValueError("A click target is required.")
         if len(target) > 200 or re.search(r"[\x00-\x1f]", target):
             raise ValueError("The click target is invalid.")
-        return name, {"target": target}
+        window = _clean_window_title(arguments.get("window")) or ""
+        result = {"target": target}
+        if window:
+            result["window"] = window[:200]
+        return name, result
+    if name == "close_application":
+        app_name = _clean_app_name(str(arguments.get("app_name", "")))
+        if not app_name:
+            app_name = _close_app_from_request(user_text) or ""
+        app_name = re.sub(r"\s+(?:please|for me)$", "", app_name, flags=re.I).strip()
+        if not app_name:
+            raise ValueError("Which app should I close?")
+        lowered = app_name.lower()
+        if lowered in _GENERIC_WINDOW_TARGETS or lowered in {"window", "tab"}:
+            raise ValueError(
+                "Name the app to close (for example: close Chrome), or say 'close window'."
+            )
+        if len(app_name) > 120:
+            raise ValueError("The application name is too long.")
+        if re.search(r"[\\/:;|<>`$%^\x00-\x1f]", app_name):
+            raise ValueError("The application name contains unsupported characters.")
+        force = bool(arguments.get("force", False))
+        return name, {"app_name": app_name, "force": force}
+    if name == "focus_window":
+        title = _clean_window_title(str(arguments.get("title", "")))
+        if not title and user_text:
+            title = _focus_from_request(user_text) or ""
+        if not title:
+            raise ValueError("Which window should I switch to?")
+        if title.lower() in _GENERIC_WINDOW_TARGETS:
+            raise ValueError("Tell me which window by name, for example: switch to Notepad.")
+        if len(title) > 200 or re.search(r"[\x00-\x1f]", title):
+            raise ValueError("The window title is invalid.")
+        return name, {"title": title}
+    if name == "window_manage":
+        action = normalize_window_action(arguments.get("action", ""))
+        if not action and user_text:
+            repaired = _window_manage_from_request(user_text)
+            if repaired:
+                action = repaired[0]
+        if not action:
+            raise ValueError("Use minimize, maximize, or restore.")
+        title = _clean_window_title(str(arguments.get("title", "")))
+        if not title and user_text:
+            repaired = _window_manage_from_request(user_text)
+            if repaired:
+                title = repaired[1]
+        if not title:
+            raise ValueError("Which window should I change?")
+        if title.lower() in _GENERIC_WINDOW_TARGETS:
+            raise ValueError("Tell me which window by name, for example: minimize Notepad.")
+        if len(title) > 200 or re.search(r"[\x00-\x1f]", title):
+            raise ValueError("The window title is invalid.")
+        return name, {"title": title, "action": action}
+    if name == "system_control":
+        action = normalize_system_action(arguments.get("action", ""), user_text)
+        if not action:
+            raise ValueError(
+                "Use lock, shutdown, restart, sleep, or hibernate."
+            )
+        return name, {"action": action}
     if name == "press_hotkey":
         raw_keys = arguments.get("keys", [])
         try:
@@ -376,6 +618,27 @@ def fast_route(text: str) -> ToolCall | None:
         return ToolCall(name="control_media", arguments={"action": action}, source="fast",
                         confidence=1.0, reasoning="Matched media phrase.", user_text=text)
 
+    sleep_match = _SLEEP_RE.fullmatch(cleaned)
+    if sleep_match:
+        try:
+            name, arguments = validate_call("system_control", {"action": "sleep"})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched sleep phrase.", user_text=text)
+
+    system = _SYSTEM_RE.fullmatch(cleaned)
+    if system:
+        verb = re.sub(r"\s+", " ", system.group(1).lower())
+        action = _SYSTEM_VERBS.get(verb)
+        if action:
+            try:
+                name, arguments = validate_call("system_control", {"action": action})
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched system-control phrase.", user_text=text)
+
     hotkey_phrase = re.sub(r"\s+(this|that|it|the file|the document)$", "", cleaned)
     if hotkey_phrase in _HOTKEY_PHRASES:
         return ToolCall(name="press_hotkey", arguments={"keys": list(_HOTKEY_PHRASES[hotkey_phrase])},
@@ -398,10 +661,53 @@ def fast_route(text: str) -> ToolCall | None:
                 return ToolCall(name="press_hotkey", arguments={"keys": keys}, source="fast",
                                 confidence=1.0, reasoning="Matched key chord.", user_text=text)
 
+    closed = _CLOSE_RE.fullmatch(original)
+    if re.fullmatch(r"(?:please\s+)?close(?:\s+the)?\s+window", cleaned):
+        try:
+            name, arguments = validate_call("press_hotkey", {"keys": ["alt", "f4"]})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched close-window shortcut.", user_text=text)
+    if closed:
+        app_name = _close_app_from_request(text)
+        if app_name:
+            try:
+                name, arguments = validate_call("close_application", {"app_name": app_name})
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched close-app phrase.", user_text=text)
+
+    managed = _window_manage_from_request(text)
+    if managed:
+        action, title = managed
+        try:
+            name, arguments = validate_call(
+                "window_manage", {"action": action, "title": title}
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched window-manage phrase.", user_text=text)
+
+    focused = _focus_from_request(text)
+    if focused:
+        try:
+            name, arguments = validate_call("focus_window", {"title": focused})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched focus-window phrase.", user_text=text)
+
     opened = _OPEN_RE.fullmatch(original)
     if opened:
         app_name = _open_app_from_request(text)
-        if app_name and len(app_name) <= 120:
+        if (
+            app_name
+            and len(app_name) <= 120
+            and not re.search(r"\b(?:and|then|after|plus)\b", app_name.lower())
+        ):
             try:
                 name, arguments = validate_call("open_application", {"app_name": app_name})
             except ValueError:
@@ -420,6 +726,33 @@ def fast_route(text: str) -> ToolCall | None:
             return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                             reasoning="Matched type-text phrase.", user_text=text)
 
+    cursor_move = _CURSOR_MOVE_RE.fullmatch(cleaned)
+    if cursor_move:
+        dest = cursor_move.group(1).strip()
+        return ToolCall(name="click_element", arguments={"target": f"move cursor to {dest}"},
+                        source="fast", confidence=1.0, reasoning="Matched cursor movement.", user_text=text)
+
+    right_click = _RIGHT_CLICK_RE.fullmatch(cleaned)
+    if right_click:
+        target = (right_click.group(1) or "").strip()
+        arg = f"right click {target}".strip() if target else "right click"
+        return ToolCall(name="click_element", arguments={"target": arg},
+                        source="fast", confidence=1.0, reasoning="Matched right-click phrase.", user_text=text)
+
+    double_click = _DOUBLE_CLICK_RE.fullmatch(cleaned)
+    if double_click:
+        target = (double_click.group(1) or "").strip()
+        arg = f"double click {target}".strip() if target else "double click"
+        return ToolCall(name="click_element", arguments={"target": arg},
+                        source="fast", confidence=1.0, reasoning="Matched double-click phrase.", user_text=text)
+
+    scrolled = _SCROLL_RE.fullmatch(cleaned)
+    if scrolled:
+        direction = scrolled.group(1).lower()
+        amount = scrolled.group(2) or "5"
+        return ToolCall(name="click_element", arguments={"target": f"scroll {direction} {amount}"},
+                        source="fast", confidence=1.0, reasoning="Matched scroll phrase.", user_text=text)
+
     clicked = _CLICK_RE.fullmatch(original)
     if clicked:
         target = _clean_click_target(clicked.group(1))
@@ -428,6 +761,37 @@ def fast_route(text: str) -> ToolCall | None:
                             confidence=1.0, reasoning="Matched click phrase.", user_text=text)
 
     return None
+
+
+def is_destructive(call: ToolCall) -> bool:
+    """Whether a call can lose data or end the session, so it needs confirmation."""
+    if not call.name:
+        return False
+    if call.name == "system_control":
+        return str(call.arguments.get("action", "")) in {
+            "shutdown", "restart", "sleep", "hibernate",
+        }
+    if call.name == "close_application":
+        return bool(call.arguments.get("force"))
+    return False
+
+
+def destructive_description(call: ToolCall) -> str:
+    if call.name == "system_control":
+        action = str(call.arguments.get("action", ""))
+        labels = {
+            "shutdown": "shut down the PC (unsaved work may be lost)",
+            "restart": "restart the PC (unsaved work may be lost)",
+            "sleep": "put the PC to sleep",
+            "hibernate": "hibernate the PC",
+        }
+        return labels.get(action, f"{action} the PC")
+    if call.name == "close_application":
+        app_name = str(call.arguments.get("app_name", "the app"))
+        if call.arguments.get("force"):
+            return f"force close {app_name} (unsaved work will be lost)"
+        return f"close {app_name}"
+    return "run this action"
 
 
 def badge_text(call: ToolCall) -> str:
@@ -445,6 +809,17 @@ def badge_text(call: ToolCall) -> str:
         detail = "+".join(str(k) for k in call.arguments.get("keys", []))
     elif call.name == "control_media":
         detail = str(call.arguments.get("action", ""))
+    elif call.name == "close_application":
+        detail = str(call.arguments.get("app_name", "")) + (" (force)" if call.arguments.get("force") else "")
+    elif call.name in {"focus_window", "window_manage"}:
+        detail = str(call.arguments.get("title", ""))
+        action = str(call.arguments.get("action", ""))
+        if action:
+            detail = f"{action} {detail}".strip()
+    elif call.name == "system_control":
+        detail = str(call.arguments.get("action", ""))
+    if call.name in {"type_text", "click_element"} and call.arguments.get("window"):
+        detail = f"{detail} → {call.arguments['window']}"
     detail = _compact(detail)
     if len(detail) > 38:
         detail = detail[:35] + "..."
@@ -468,4 +843,23 @@ def describe_call(call: ToolCall) -> str:
         return "Taking a screenshot"
     if call.name == "control_media":
         return f"Media: {call.arguments.get('action', 'action')}"
+    if call.name == "close_application":
+        suffix = " (forced)" if call.arguments.get("force") else ""
+        return f"Closing {call.arguments.get('app_name', 'the app')}{suffix}"
+    if call.name == "focus_window":
+        return f"Switching to {call.arguments.get('title', 'the window')}"
+    if call.name == "window_manage":
+        return f"{str(call.arguments.get('action', '')).title()}ing {call.arguments.get('title', 'the window')}"
+    if call.name == "system_control":
+        labels = {
+            "lock": "Locking the PC",
+            "shutdown": "Shutting down the PC",
+            "restart": "Restarting the PC",
+            "sleep": "Putting the PC to sleep",
+            "hibernate": "Hibernating the PC",
+        }
+        return labels.get(str(call.arguments.get("action", "")), "Controlling the PC")
+    if call.name in {"type_text", "click_element"} and call.arguments.get("window"):
+        target = call.arguments.get("text") if call.name == "type_text" else call.arguments.get("target")
+        return f"{'Typing' if call.name == 'type_text' else 'Clicking'} {target} in {call.arguments['window']}"
     return "Running the action"

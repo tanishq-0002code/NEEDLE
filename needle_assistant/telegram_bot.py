@@ -10,6 +10,8 @@ import requests
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from . import __version__
+from .catalog import destructive_description
+from .confirmation import ConfirmationStore
 from .models import ExecutionResult, ToolCall
 
 log = logging.getLogger("needle.telegram")
@@ -55,13 +57,24 @@ class TelegramBot(QObject):
         allowed_chat_ids: Sequence[int],
         handler: CommandHandler,
         status_provider: StatusProvider,
+        on_pair: Callable[[int], None] | None = None,
+        *,
+        classify: Callable[[str], ToolCall | None] | None = None,
+        confirmation_required: Callable[[ToolCall], bool] | None = None,
+        executor: Callable[[str], tuple[ToolCall, ExecutionResult]] | None = None,
+        confirmation_store: ConfirmationStore | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._token = str(token or "").strip()
         self._allowed = {int(value) for value in allowed_chat_ids}
         self._handler = handler
+        self._executor = executor or handler
         self._status_provider = status_provider
+        self._on_pair = on_pair
+        self._classify = classify
+        self._confirmation_required = confirmation_required
+        self._confirmation_store = confirmation_store
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._session = requests.Session()
@@ -221,13 +234,43 @@ class TelegramBot(QObject):
             self._send_html(chat_id, f"Your Telegram chat ID is:\n<code>{chat_id}</code>")
             return
         if not self._authorized(chat_id):
-            self._send(
-                chat_id,
-                "This Needle bot is not paired with this chat yet.\n\n"
-                f"Your chat ID is: {chat_id}\n\n"
-                "Open Needle Desktop → Settings → Telegram and add this ID to "
-                "Allowed chat IDs. Until then, commands are ignored.",
+            if not self._allowed:
+                # Zero-friction auto-pairing for the bot owner
+                self._allowed.add(chat_id)
+                log.info("Telegram bot auto-paired with chat ID %s.", chat_id)
+                if self._on_pair is not None:
+                    try:
+                        self._on_pair(chat_id)
+                    except Exception:
+                        pass
+                self._send(chat_id, f"Needle Desktop paired with chat ID {chat_id}. Processing your command…")
+            else:
+                self._send(
+                    chat_id,
+                    "This Needle bot is not paired with this chat yet.\n\n"
+                    f"Your chat ID is: {chat_id}\n\n"
+                    "Open Needle Desktop → Settings → Telegram and add this ID to "
+                    "Allowed chat IDs. Until then, commands are ignored.",
+                )
+                return
+
+        if command == "/confirm":
+            pending = (
+                self._confirmation_store.take(chat_id)
+                if self._confirmation_store is not None
+                else None
             )
+            if pending is None:
+                self._send(chat_id, "Nothing to confirm. Send a command first.")
+                return
+            self._send(chat_id, f"Confirmed: {pending.description}")
+            self._send_typing(chat_id)
+            self._execute_remote(pending.text, chat_id)
+            return
+        if command == "/cancel":
+            if self._confirmation_store is not None:
+                self._confirmation_store.clear(chat_id)
+            self._send(chat_id, "Cancelled. Nothing was changed.")
             return
 
         if command == "/status":
@@ -240,30 +283,66 @@ class TelegramBot(QObject):
             return
         if command == "/screenshot":
             text = "take a screenshot"
+        elif command in {"/camera", "/photo"}:
+            text = "capture camera"
         elif command:
             self._send(chat_id, "Unknown command. Send /help for the list.")
             return
 
+        if (
+            self._classify is not None
+            and self._confirmation_required is not None
+            and command == ""
+        ):
+            try:
+                call = self._classify(text)
+            except Exception:
+                call = None
+            if call is not None and self._confirmation_required(call):
+                if self._confirmation_store is None:
+                    self._send(
+                        chat_id,
+                        "This action needs confirmation on the PC. It was not run.",
+                    )
+                    return
+                if not self._confirmation_store.request(
+                    chat_id, text, destructive_description(call)
+                ):
+                    self._send(
+                        chat_id,
+                        "You already have an action waiting. Reply /confirm or /cancel.",
+                    )
+                    return
+                self._send(
+                    chat_id,
+                    f"⚠️ {destructive_description(call)}.\n"
+                    "Reply /confirm to proceed or /cancel to stop.",
+                )
+                return
+
         self._send_typing(chat_id)
+        self._execute_remote(text, chat_id)
+
+    def _execute_remote(self, text: str, chat_id: int) -> None:
         try:
             call, result = self._handler(text)
         except Exception as exc:
             log.exception("Telegram command failed.")
-            self._send(chat_id, f"The command failed: {self._safe_error(exc)}")
+            self._send(chat_id, f"Not done: {self._safe_error(exc)}")
             return
 
         if call is None or not call.name:
-            message_text = "I couldn't map that to a desktop action."
-            if call is not None:
-                message_text = call.error or call.reasoning or message_text
-            self._send(chat_id, message_text)
+            reason = "I couldn't map that to a desktop action."
+            if call is not None and (call.error or call.reasoning):
+                reason = call.error or call.reasoning
+            self._send(chat_id, f"Not done: {reason}")
             return
         if result is None:
-            self._send(chat_id, f"{call.name} did not return a result.")
+            self._send(chat_id, f"Not done: {call.name} did not return a result.")
             return
 
         screenshot_path: Path | None = None
-        if result.tool == "take_screenshot" and result.path:
+        if result.tool in {"take_screenshot", "capture_camera"} and result.path:
             try:
                 candidate = Path(result.path)
                 if candidate.is_file():
@@ -271,10 +350,18 @@ class TelegramBot(QObject):
             except OSError:
                 screenshot_path = None
         if screenshot_path is not None:
-            self._send_photo(chat_id, screenshot_path, result.message or "Screenshot")
+            caption = (
+                f"Done: {result.message or 'Captured image'}"
+                if result.success
+                else f"Not done: {result.message}"
+            )
+            self._send_photo(chat_id, screenshot_path, caption)
             return
-        prefix = "Done: " if result.success else "Failed: "
-        self._send(chat_id, prefix + (result.message or call.name))
+
+        if result.success:
+            self._send(chat_id, f"Done: {result.message or call.name}")
+        else:
+            self._send(chat_id, f"Not done: {result.message or 'Action failed'}")
 
     def _authorized(self, chat_id: int) -> bool:
         return bool(self._allowed) and int(chat_id) in self._allowed

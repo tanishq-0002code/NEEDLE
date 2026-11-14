@@ -17,15 +17,75 @@ from typing import Iterable
 import psutil
 
 from . import windows_api as win
-from .catalog import normalize_keys
+from .catalog import normalize_keys, normalize_system_action, normalize_window_action
 from .models import ExecutionResult, ToolCall
 from .paths import pictures_dir
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
+WM_CLOSE = 0x0010
+SW_MINIMIZE = 6
+SW_MAXIMIZE = 3
+APP_MATCH_THRESHOLD = 0.80
+_PROTECTED_PROCESSES = {
+    "csrss.exe", "winlogon.exe", "services.exe", "lsass.exe", "smss.exe",
+    "wininit.exe", "system", "registry", "memory compression", "idle",
+    "explorer.exe", "needledesktop.exe",
+}
+
 
 class AutomationError(RuntimeError):
     pass
+
+
+class AmbiguousAppError(AutomationError):
+    """Raised when the requested app name is unclear; carries candidates."""
+
+    def __init__(self, message: str, candidates: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.candidates = list(candidates or [])
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wt.DWORD), ("HighPart", wt.LONG)]
+
+
+class _LUID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("Luid", _LUID), ("Attributes", wt.DWORD)]
+
+
+class _TOKEN_PRIVILEGES(ctypes.Structure):
+    _fields_ = [("PrivilegeCount", wt.DWORD),
+                ("Privileges", _LUID_AND_ATTRIBUTES * 1)]
+
+
+EWX_POWEROFF = 0x00000008
+EWX_REBOOT = 0x00000002
+EWX_FORCEIFHUNG = 0x00000010
+
+
+def _enable_shutdown_privilege() -> bool:
+    try:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        token = wt.HANDLE()
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), 0x0020 | 0x0008, ctypes.byref(token)
+        ):
+            return False
+        luid = _LUID()
+        if not advapi32.LookupPrivilegeValueW(None, "SeShutdownPrivilege", ctypes.byref(luid)):
+            return False
+        privileges = _TOKEN_PRIVILEGES()
+        privileges.PrivilegeCount = 1
+        privileges.Privileges[0].Luid = luid
+        privileges.Privileges[0].Attributes = 0x00000002
+        return bool(advapi32.AdjustTokenPrivileges(
+            token, False, ctypes.byref(privileges), 0, None, None
+        ))
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -293,7 +353,32 @@ class AppResolver:
         if name in menu:
             return ResolvedApp("lnk", str(menu[name]), self._display(menu[name].stem))
 
+        scored = self.candidates(name)
+        if scored and scored[0][0] >= APP_MATCH_THRESHOLD:
+            best_score, _key, best_path = scored[0]
+            return ResolvedApp("lnk", str(best_path), self._display(best_path.stem))
+
+        names = ", ".join(key for _score, key, _path in scored[:3])
+        message = f"I couldn't find an app called \"{raw_name}\"."
+        if names:
+            message += f" Did you mean: {names}?"
+        else:
+            message += " Try the exact name shown in the Start menu."
+        raise AmbiguousAppError(message, [key for _score, key, _path in scored[:3]])
+
+    def candidates(self, raw_name: str, limit: int = 5) -> list[tuple[float, str, Path]]:
+        """Ranked Start-menu matches (score, menu key, path) for clarification."""
+        name = _norm(raw_name)
+        if not name:
+            return []
+        menu = self._start_menu_index()
         scored: list[tuple[float, str, Path]] = []
+        for key, path in menu.items():
+            if name == key:
+                scored.append((1.0, key, path))
+        if scored:
+            scored.sort(key=lambda item: (-item[0], len(item[1])))
+            return scored[:limit]
         for key, path in menu.items():
             if name in key or key in name:
                 score = 0.92
@@ -301,15 +386,8 @@ class AppResolver:
                 score = difflib.SequenceMatcher(None, name, key).ratio()
             if score >= 0.64:
                 scored.append((score, key, path))
-        if scored:
-            scored.sort(key=lambda item: (-item[0], len(item[1])))
-            best_score, _key, best_path = scored[0]
-            if best_score >= 0.64:
-                return ResolvedApp("lnk", str(best_path), self._display(best_path.stem))
-
-        raise AutomationError(
-            f"I couldn't find an app called \"{raw_name}\". Try the exact name shown in the Start menu."
-        )
+        scored.sort(key=lambda item: (-item[0], len(item[1])))
+        return scored[:limit]
 
     @staticmethod
     def _display(value: str) -> str:
@@ -330,7 +408,7 @@ class DesktopAutomation:
         try:
             import pyautogui
 
-            pyautogui.FAILSAFE = True
+            pyautogui.FAILSAFE = False
             pyautogui.PAUSE = 0.05
         except Exception:
             pass
@@ -354,12 +432,34 @@ class DesktopAutomation:
                     return ExecutionResult(False, call.error or "No action was selected.", call.name or "")
                 if call.name == "open_application":
                     return self._open_application(str(call.arguments.get("app_name", "")))
+                if call.name == "close_application":
+                    return self._close_application(
+                        str(call.arguments.get("app_name", "")),
+                        bool(call.arguments.get("force", False)),
+                    )
+                if call.name == "focus_window":
+                    return self._focus_window(str(call.arguments.get("title", "")))
+                if call.name == "window_manage":
+                    return self._window_manage(
+                        str(call.arguments.get("title", "")),
+                        str(call.arguments.get("action", "")),
+                    )
+                if call.name == "system_control":
+                    return self._system_control(str(call.arguments.get("action", "")))
                 if call.name == "type_text":
-                    self._restore(restore_hwnd)
+                    target_hwnd = self._resolve_target_window(
+                        call.arguments.get("window"), restore_hwnd
+                    )
+                    self._restore(target_hwnd)
                     return self._type_text(str(call.arguments.get("text", "")))
                 if call.name == "click_element":
-                    self._restore(restore_hwnd)
-                    return self._click_element(str(call.arguments.get("target", "")), restore_hwnd)
+                    target_hwnd = self._resolve_target_window(
+                        call.arguments.get("window"), restore_hwnd
+                    )
+                    self._restore(target_hwnd)
+                    return self._click_element(
+                        str(call.arguments.get("target", "")), target_hwnd
+                    )
                 if call.name == "press_hotkey":
                     self._restore(restore_hwnd)
                     return self._press_hotkey(list(call.arguments.get("keys", [])))
@@ -367,6 +467,8 @@ class DesktopAutomation:
                     self._restore(restore_hwnd)
                     time.sleep(0.22)
                     return self._screenshot()
+                if call.name == "capture_camera":
+                    return self._capture_camera()
                 if call.name == "control_media":
                     return self._control_media(str(call.arguments.get("action", "")))
                 return ExecutionResult(False, f"Unknown action: {call.name}", call.name)
@@ -532,38 +634,103 @@ class DesktopAutomation:
     def _click_element(self, target: str, restore_hwnd: int) -> ExecutionResult:
         self._prepare_gui()
         self._failsafe()
+        import pyautogui
+
+        raw = (target or "").strip()
+        lower = raw.lower()
+
+        # 1. Cursor movement without clicking
+        move_match = re.search(r"^(?:move\s+(?:the\s+)?(?:cursor|mouse)\s+(?:to\s+)?|hover\s+(?:over\s+)?)(.+)$", lower)
+        if move_match:
+            sub = move_match.group(1).strip()
+            coord = re.search(r"(-?\d{1,5})\s*[, ]\s*(-?\d{1,5})", sub)
+            if coord:
+                x, y = int(coord.group(1)), int(coord.group(2))
+                self._check_point(x, y)
+                pyautogui.moveTo(x, y, duration=0.2)
+                return ExecutionResult(True, f"Moved cursor to {x}, {y}.", "click_element")
+            screen = self._screen_size()
+            aliases = self._screen_aliases(screen)
+            if sub in aliases:
+                x, y = aliases[sub]
+                pyautogui.moveTo(x, y, duration=0.2)
+                return ExecutionResult(True, f"Moved cursor to {sub}.", "click_element")
+
+        # 2. Scrolling
+        scroll_match = re.search(r"\bscroll\s+(up|down)(?:\s+(\d+))?\b", lower)
+        if scroll_match:
+            direction = scroll_match.group(1).lower()
+            amount = int(scroll_match.group(2)) if scroll_match.group(2) else 5
+            clicks = amount * 120 if direction == "up" else -amount * 120
+            pyautogui.scroll(clicks)
+            return ExecutionResult(True, f"Scrolled {direction} {amount} units.", "click_element")
+
+        # 3. Mouse button variants (right click, double click, middle click)
+        btn = "left"
+        clicks_count = 1
+        sub_target = raw
+        if re.search(r"\bright[\s-]click\b", lower):
+            btn = "right"
+            sub_target = re.sub(r"(?i)\b(?:please\s+)?(?:do\s+a\s+)?right[\s-]click(?:\s+(?:on|at))?\s*", "", raw).strip()
+        elif re.search(r"\bdouble[\s-]click\b", lower):
+            btn = "left"
+            clicks_count = 2
+            sub_target = re.sub(r"(?i)\b(?:please\s+)?(?:do\s+a\s+)?double[\s-]click(?:\s+(?:on|at))?\s*", "", raw).strip()
+        elif re.search(r"\bmiddle[\s-]click\b", lower):
+            btn = "middle"
+            sub_target = re.sub(r"(?i)\b(?:please\s+)?(?:do\s+a\s+)?middle[\s-]click(?:\s+(?:on|at))?\s*", "", raw).strip()
+        else:
+            sub_target = re.sub(r"(?i)\b(?:please\s+)?(?:click|tap)(?:\s+(?:on|at))?\s*", "", raw).strip()
+
+        # If sub_target is empty, click at the current mouse cursor location
+        if not sub_target or sub_target.lower() in {"here", "this", "it"}:
+            pos = pyautogui.position()
+            pyautogui.click(pos.x, pos.y, clicks=clicks_count, button=btn)
+            action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
+            return ExecutionResult(True, f"{action_desc} at current position ({pos.x}, {pos.y}).", "click_element")
+
         coordinate = re.fullmatch(
             r"\s*(?:at\s+|coordinates?\s+)?(-?\d{1,5})\s*[, ]\s*(-?\d{1,5})\s*",
-            target,
+            sub_target,
             flags=re.I,
         )
         if coordinate:
             x, y = int(coordinate.group(1)), int(coordinate.group(2))
             self._check_point(x, y)
-            self._mouse_click(x, y)
-            return ExecutionResult(True, f"Clicked {x}, {y}.", "click_element")
+            pyautogui.moveTo(x, y, duration=0.12)
+            pyautogui.click(x, y, clicks=clicks_count, button=btn)
+            action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
+            return ExecutionResult(True, f"{action_desc} at {x}, {y}.", "click_element")
 
         screen = self._screen_size()
-        semantic = target.lower().strip().strip(".")
-        aliases = {
-            "center": (screen[0] // 2, screen[1] // 2),
-            "middle": (screen[0] // 2, screen[1] // 2),
-            "top left": (screen[0] // 6, screen[1] // 6),
-            "top right": (screen[0] * 5 // 6, screen[1] // 6),
-            "bottom left": (screen[0] // 6, screen[1] * 5 // 6),
-            "bottom right": (screen[0] * 5 // 6, screen[1] * 5 // 6),
-            "top center": (screen[0] // 2, screen[1] // 6),
-            "bottom center": (screen[0] // 2, screen[1] * 5 // 6),
-            "left center": (screen[0] // 6, screen[1] // 2),
-            "right center": (screen[0] * 5 // 6, screen[1] // 2),
-        }
+        semantic = sub_target.lower().strip().strip(".")
+        aliases = self._screen_aliases(screen)
         if semantic in aliases:
             x, y = aliases[semantic]
-            self._mouse_click(x, y)
-            return ExecutionResult(True, f"Clicked the {semantic} of the screen.", "click_element")
+            pyautogui.moveTo(x, y, duration=0.12)
+            pyautogui.click(x, y, clicks=clicks_count, button=btn)
+            action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
+            return ExecutionResult(True, f"{action_desc} the {semantic} of the screen.", "click_element")
 
-        self._click_uia(target, restore_hwnd)
-        return ExecutionResult(True, f"Clicked {target}.", "click_element")
+        self._click_uia(sub_target, restore_hwnd, button=btn, clicks=clicks_count)
+        action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
+        return ExecutionResult(True, f"{action_desc} {sub_target}.", "click_element")
+
+    @staticmethod
+    def _screen_aliases(screen: tuple[int, int]) -> dict[str, tuple[int, int]]:
+        w, h = screen
+        return {
+            "center": (w // 2, h // 2),
+            "middle": (w // 2, h // 2),
+            "top left": (w // 6, h // 6),
+            "top right": (w * 5 // 6, h // 6),
+            "bottom left": (w // 6, h * 5 // 6),
+            "bottom right": (w * 5 // 6, h * 5 // 6),
+            "top center": (w // 2, h // 6),
+            "bottom center": (w // 2, h * 5 // 6),
+            "left center": (w // 6, h // 2),
+            "right center": (w * 5 // 6, h // 2),
+        }
 
     @staticmethod
     def _screen_size() -> tuple[int, int]:
@@ -580,14 +747,14 @@ class DesktopAutomation:
         if not (0 <= x < width and 0 <= y < height):
             raise AutomationError(f"The point {x}, {y} is outside the screen.")
 
-    def _mouse_click(self, x: int, y: int) -> None:
+    def _mouse_click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> None:
         self._failsafe()
         import pyautogui
 
         pyautogui.moveTo(x, y, duration=0.12)
-        pyautogui.click()
+        pyautogui.click(x, y, clicks=clicks, button=button)
 
-    def _click_uia(self, target: str, hwnd: int) -> None:
+    def _click_uia(self, target: str, hwnd: int, button: str = "left", clicks: int = 1) -> None:
         try:
             import comtypes
             import uiautomation as auto
@@ -619,14 +786,18 @@ class DesktopAutomation:
                 found.SetFocus()
             except Exception:
                 pass
-            try:
-                found.Click(simulateMove=False)
-            except Exception:
+            if button == "left" and clicks == 1:
                 try:
-                    point = found.GetClickablePoint()
-                    self._mouse_click(int(point.x), int(point.y))
-                except Exception as exc:
-                    raise AutomationError(f"I found \"{target}\" but couldn't click it.") from exc
+                    found.Click(simulateMove=False)
+                    time.sleep(0.1)
+                    return
+                except Exception:
+                    pass
+            try:
+                point = found.GetClickablePoint()
+                self._mouse_click(int(point.x), int(point.y), button=button, clicks=clicks)
+            except Exception as exc:
+                raise AutomationError(f"I found \"{target}\" but couldn't click it.") from exc
             time.sleep(0.1)
         finally:
             try:
@@ -658,16 +829,292 @@ class DesktopAutomation:
                 queue.append((child, depth + 1))
         return None
 
-    def _screenshot(self) -> ExecutionResult:
-        from PIL import ImageGrab
+    def _grab_screen_image(self):
+        """Captures the screen using Windows GDI BitBlt, with PyQt6 and PIL fallbacks."""
+        # Method 1: Direct Windows GDI BitBlt (100% reliable across all sessions)
+        try:
+            from PIL import Image
 
+            gdi32 = ctypes.windll.gdi32
+            w = user32.GetSystemMetrics(0)
+            h = user32.GetSystemMetrics(1)
+            hdc_screen = user32.GetDC(0)
+            if hdc_screen:
+                try:
+                    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+                    if hdc_mem:
+                        try:
+                            hbm = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+                            if hbm:
+                                try:
+                                    gdi32.SelectObject(hdc_mem, hbm)
+                                    gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, 0, 0, 0x00CC0020)
+                                    bi = ctypes.c_buffer(40)
+                                    ctypes.c_ulong.from_buffer(bi, 0).value = 40
+                                    ctypes.c_long.from_buffer(bi, 4).value = w
+                                    ctypes.c_long.from_buffer(bi, 8).value = -h
+                                    ctypes.c_ushort.from_buffer(bi, 12).value = 1
+                                    ctypes.c_ushort.from_buffer(bi, 14).value = 32
+                                    buf = ctypes.create_string_buffer(w * h * 4)
+                                    gdi32.GetDIBits(hdc_mem, hbm, 0, h, buf, bi, 0)
+                                    return Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
+                                finally:
+                                    gdi32.DeleteObject(hbm)
+                        finally:
+                            gdi32.DeleteDC(hdc_mem)
+                finally:
+                    user32.ReleaseDC(0, hdc_screen)
+        except Exception:
+            pass
+
+        # Method 2: PyQt6 screen capture
+        try:
+            import io
+            from PIL import Image
+            from PyQt6.QtWidgets import QApplication
+            from PyQt6.QtGui import QGuiApplication
+            from PyQt6.QtCore import QBuffer, QIODevice
+
+            app = QApplication.instance()
+            if app is not None:
+                screen = QGuiApplication.primaryScreen()
+                if screen is not None:
+                    pix = screen.grabWindow(0)
+                    if not pix.isNull():
+                        qbuf = QBuffer()
+                        qbuf.open(QIODevice.OpenModeFlag.ReadWrite)
+                        pix.save(qbuf, "PNG")
+                        data = bytes(qbuf.data())
+                        qbuf.close()
+                        return Image.open(io.BytesIO(data))
+        except Exception:
+            pass
+
+        # Method 3: Pillow ImageGrab fallback
+        from PIL import ImageGrab
+        return ImageGrab.grab(all_screens=False)
+
+    def _screenshot(self) -> ExecutionResult:
         folder = pictures_dir()
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         path = folder / f"Needle_Screenshot_{stamp}.png"
-        image = ImageGrab.grab(all_screens=False)
+        image = self._grab_screen_image()
         image.save(path, "PNG")
-        return ExecutionResult(True, f"Saved a screenshot to {path.name}.", "take_screenshot",
-                               path=str(path))
+
+        fg = win.get_foreground_window()
+        title = win.get_window_title(fg) if fg else ""
+        msg = f"Saved a screenshot to {path.name}."
+        if title:
+            msg += f" (Active window: {title})"
+        return ExecutionResult(True, msg, "take_screenshot", path=str(path))
+
+    def _capture_camera(self) -> ExecutionResult:
+        from PIL import Image
+
+        folder = pictures_dir()
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        path = folder / f"Needle_Camera_{stamp}.jpg"
+
+        try:
+            import cv2
+
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                raise AutomationError("No camera device could be opened.")
+            try:
+                for _ in range(4):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    time.sleep(0.04)
+                if not ret or frame is None:
+                    raise AutomationError("Camera capture returned empty frame.")
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb)
+                img.save(path, "JPEG", quality=92)
+                return ExecutionResult(True, f"Captured photo to {path.name}.", "capture_camera", path=str(path))
+            finally:
+                cap.release()
+        except Exception as exc:
+            try:
+                os.startfile("microsoft.windows.camera:")
+                return ExecutionResult(True, "Opened Windows Camera application.", "capture_camera")
+            except Exception:
+                raise AutomationError(f"Could not access camera: {exc}") from exc
+
+    # ------------------------------------------------------------------ windows & power
+    @staticmethod
+    def _windows_by_title(title: str) -> list[win.WindowInfo]:
+        wanted = re.sub(r"\s+", " ", str(title or "").strip().lower())
+        if not wanted:
+            return []
+        return [info for info in win.enumerate_windows() if wanted in info.title.lower()]
+
+    @staticmethod
+    def _pids_for_exe(exe_name: str) -> set[int]:
+        wanted = str(exe_name or "").strip().lower()
+        pids: set[int] = set()
+        if not wanted:
+            return pids
+        try:
+            for proc in psutil.process_iter(["pid", "name", "exe"]):
+                try:
+                    info = proc.info or {}
+                    name = str(info.get("name") or "").lower()
+                    path = Path(str(info.get("exe") or "")).name.lower()
+                    if wanted in {name, path}:
+                        pids.add(int(info["pid"]))
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError, TypeError):
+                    continue
+        except Exception:
+            return pids
+        return pids
+
+    def _windows_for_pids(self, pids: set[int]) -> list[win.WindowInfo]:
+        return [info for info in win.enumerate_windows() if info.pid in pids]
+
+    def _resolve_target_window(self, window: object, fallback: int) -> int:
+        title = str(window or "").strip()
+        if not title:
+            return fallback
+        matches = self._windows_by_title(title)
+        if not matches:
+            raise AutomationError(f"I couldn't find a window titled \"{title}\".")
+        if len(matches) > 1:
+            titles = ", ".join(info.title for info in matches[:4])
+            raise AutomationError(f"Several windows match \"{title}\": {titles}.")
+        return matches[0].hwnd
+
+    def _close_application(self, app_name: str, force: bool = False) -> ExecutionResult:
+        resolved = self._resolver.resolve(app_name)
+        if resolved.kind != "exe":
+            raise AutomationError(
+                f"I can't close {resolved.display_name} this way. Name a running application."
+            )
+        exe_name = Path(resolved.target).name
+        if exe_name.lower() in _PROTECTED_PROCESSES:
+            raise AutomationError(f"Refusing to close {exe_name}: it is a system process.")
+        if exe_name.lower() == "explorer.exe":
+            raise AutomationError(
+                "Use 'close window' (Alt+F4) to close a File Explorer window."
+            )
+        pids = self._pids_for_exe(exe_name)
+        if not pids:
+            raise AutomationError(f"{resolved.display_name} doesn't appear to be running.")
+        windows = self._windows_for_pids(pids)
+        if not windows and not force:
+            raise AutomationError(f"{resolved.display_name} has no open window to close.")
+
+        hwnds = [info.hwnd for info in windows]
+        for hwnd in hwnds:
+            try:
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            except Exception:
+                continue
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            remaining = [hwnd for hwnd in hwnds if win.is_window(hwnd)]
+            if not remaining:
+                break
+            time.sleep(0.15)
+        remaining = [hwnd for hwnd in hwnds if win.is_window(hwnd)]
+        closed = len(hwnds) - len(remaining)
+
+        if remaining and force:
+            for pid in sorted(pids):
+                try:
+                    process = psutil.Process(pid)
+                    if process.name().lower() in _PROTECTED_PROCESSES:
+                        continue
+                    process.terminate()
+                except psutil.Error:
+                    continue
+            time.sleep(1.2)
+            survivors: list[int] = []
+            for pid in sorted(pids):
+                try:
+                    process = psutil.Process(pid)
+                except psutil.Error:
+                    continue
+                if not process.is_running():
+                    continue
+                try:
+                    process.kill()
+                except psutil.Error:
+                    pass
+                survivors.append(pid)
+            if survivors:
+                raise AutomationError(
+                    f"{resolved.display_name} did not fully close (pid(s) {survivors})."
+                )
+            remaining = []
+        elif remaining:
+            raise AutomationError(
+                f"{resolved.display_name} did not close. Say 'force close {app_name}' to end it."
+            )
+
+        if closed:
+            message = f"Closed {resolved.display_name} ({closed} window{'s' if closed != 1 else ''})."
+        else:
+            message = f"Ended {resolved.display_name}."
+        return ExecutionResult(True, message, "close_application",
+                               detail=f"pids={sorted(pids)}")
+
+    def _focus_window(self, title: str) -> ExecutionResult:
+        matches = self._windows_by_title(title)
+        if not matches:
+            raise AutomationError(f"I couldn't find a window titled \"{title}\".")
+        if len(matches) > 1:
+            titles = ", ".join(info.title for info in matches[:4])
+            raise AutomationError(f"Several windows match \"{title}\": {titles}.")
+        info = matches[0]
+        win.focus_window(info.hwnd)
+        time.sleep(0.16)
+        return ExecutionResult(True, f"Switched to {info.title}.", "focus_window")
+
+    def _window_manage(self, title: str, action: str) -> ExecutionResult:
+        normalized = normalize_window_action(action)
+        if not normalized:
+            raise AutomationError("Use minimize, maximize, or restore.")
+        matches = self._windows_by_title(title)
+        if not matches:
+            raise AutomationError(f"I couldn't find a window titled \"{title}\".")
+        if len(matches) > 1:
+            titles = ", ".join(info.title for info in matches[:4])
+            raise AutomationError(f"Several windows match \"{title}\": {titles}.")
+        info = matches[0]
+        commands = {
+            "minimize": SW_MINIMIZE,
+            "maximize": SW_MAXIMIZE,
+            "restore": win.SW_RESTORE,
+        }
+        win.show_window(info.hwnd, commands[normalized])
+        time.sleep(0.18)
+        labels = {"minimize": "Minimized", "maximize": "Maximized", "restore": "Restored"}
+        return ExecutionResult(True, f"{labels[normalized]} {info.title}.", "window_manage")
+
+    def _system_control(self, action: str) -> ExecutionResult:
+        normalized = normalize_system_action(action)
+        if not normalized:
+            raise AutomationError("Use lock, shutdown, restart, sleep, or hibernate.")
+        if normalized == "lock":
+            if not bool(ctypes.windll.user32.LockWorkStation()):
+                raise AutomationError("Windows refused to lock the workstation.")
+            return ExecutionResult(True, "Locked the PC.", "system_control")
+        if normalized in {"shutdown", "restart"}:
+            flags = EWX_FORCEIFHUNG | (EWX_POWEROFF if normalized == "shutdown" else EWX_REBOOT)
+            if not _enable_shutdown_privilege():
+                raise AutomationError("Windows did not grant shutdown permission.")
+            if not bool(user32.ExitWindowsEx(flags, 0)):
+                raise AutomationError(f"Windows refused to {normalized}.")
+            return ExecutionResult(True, f"The PC is going to {normalized}.", "system_control")
+        powrprof = ctypes.WinDLL("powrprof")
+        hibernate = normalized == "hibernate"
+        if not bool(powrprof.SetSuspendState(bool(hibernate), False, False)):
+            raise AutomationError(f"Windows refused to {normalized} the PC.")
+        return ExecutionResult(True, f"The PC is going to {normalized}.", "system_control")
 
     def _control_media(self, action: str) -> ExecutionResult:
         self._prepare_gui()
