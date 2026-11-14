@@ -142,6 +142,51 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["action"],
         },
     },
+    {
+        "name": "read_screen",
+        "description": "Read text from the screen using offline OCR",
+        "triggers": [
+            r"^(?:please\s+)?(?:read|extract|ocr)\s+(?:the\s+)?(?:screen|display|window)\b",
+            r"\bwhat(?:'s|\s+is)\s+on\s+(?:my\s+|the\s+)?(?:screen|display)\b",
+        ],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string", "enum": ["foreground", "full"]},
+            },
+        },
+    },
+    {
+        "name": "clipboard",
+        "description": "Get or set the Windows clipboard",
+        "triggers": [r"\bclipboard\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "set"]},
+                "text": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "file_operation",
+        "description": "Create, read, append, list, rename, move, or delete a file or folder",
+        "triggers": [r"\b(?:file|folder|directory)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["create", "read", "append", "list", "rename", "move", "delete"],
+                },
+                "path": {"type": "string"},
+                "new_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["op", "path"],
+        },
+    },
 ]
 
 SYSTEM_PROMPT = "device: Windows desktop"
@@ -574,6 +619,45 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
                 "Use lock, shutdown, restart, sleep, or hibernate."
             )
         return name, {"action": action}
+    if name == "read_screen":
+        scope = str(arguments.get("scope", "foreground")).strip().lower()
+        if scope not in {"foreground", "full"}:
+            scope = "foreground"
+        return name, {"scope": scope}
+    if name == "clipboard":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"get", "set"}:
+            action = "get" if not str(arguments.get("text", "")).strip() else "set"
+        result = {"action": action}
+        text = str(arguments.get("text", ""))
+        if action == "set":
+            if not text and user_text:
+                match = re.search(r"(?:to|with)\s+(.+)$", user_text, re.I)
+                if match:
+                    text = match.group(1).strip().strip("\"'")
+            if not text:
+                raise ValueError("There is no text to put on the clipboard.")
+            result["text"] = text[:10000]
+        return name, result
+    if name == "file_operation":
+        op = str(arguments.get("op", "")).strip().lower()
+        if op not in {"create", "read", "append", "list", "rename", "move", "delete"}:
+            raise ValueError("Unsupported file operation.")
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise ValueError("A file path is required.")
+        if len(path) > 500:
+            raise ValueError("The file path is too long.")
+        result = {"op": op, "path": path}
+        new_path = str(arguments.get("new_path", "")).strip()
+        if new_path:
+            result["new_path"] = new_path
+        content = arguments.get("content")
+        if content is not None:
+            result["content"] = str(content)[:200000]
+        if op in {"rename", "move"} and not new_path:
+            raise ValueError("A destination path is required.")
+        return name, result
     if name == "press_hotkey":
         raw_keys = arguments.get("keys", [])
         try:
@@ -611,6 +695,20 @@ def fast_route(text: str) -> ToolCall | None:
     if _SCREENSHOT_RE.fullmatch(cleaned):
         return ToolCall(name="take_screenshot", arguments={}, source="fast", confidence=1.0,
                         reasoning="Matched screenshot phrase.", user_text=text)
+
+    read_screen_match = re.fullmatch(
+        r"(?:please\s+)?(?:read|extract|ocr)\s+(?:the\s+)?(foreground|full|screen|display|window)(?:\s+(screen|display|window))?",
+        cleaned,
+        re.I,
+    )
+    if read_screen_match or re.search(r"\b(?:read|ocr|extract)\b.*\b(?:screen|display)\b", cleaned):
+        scope = "full" if "full" in cleaned or "entire" in cleaned or "whole" in cleaned else "foreground"
+        try:
+            name, arguments = validate_call("read_screen", {"scope": scope})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched read-screen phrase.", user_text=text)
 
     media = _MEDIA_RE.fullmatch(cleaned)
     if media:
@@ -773,6 +871,8 @@ def is_destructive(call: ToolCall) -> bool:
         }
     if call.name == "close_application":
         return bool(call.arguments.get("force"))
+    if call.name == "file_operation":
+        return str(call.arguments.get("op", "")).lower() in {"delete", "rename", "move"}
     return False
 
 
@@ -791,6 +891,10 @@ def destructive_description(call: ToolCall) -> str:
         if call.arguments.get("force"):
             return f"force close {app_name} (unsaved work will be lost)"
         return f"close {app_name}"
+    if call.name == "file_operation":
+        op = str(call.arguments.get("op", ""))
+        path = str(call.arguments.get("path", "the file"))
+        return f"{op} {path}"
     return "run this action"
 
 
@@ -818,6 +922,12 @@ def badge_text(call: ToolCall) -> str:
             detail = f"{action} {detail}".strip()
     elif call.name == "system_control":
         detail = str(call.arguments.get("action", ""))
+    elif call.name == "read_screen":
+        detail = str(call.arguments.get("scope", "foreground"))
+    elif call.name == "clipboard":
+        detail = str(call.arguments.get("action", ""))
+    elif call.name == "file_operation":
+        detail = f"{call.arguments.get('op', '')} {call.arguments.get('path', '')}".strip()
     if call.name in {"type_text", "click_element"} and call.arguments.get("window"):
         detail = f"{detail} → {call.arguments['window']}"
     detail = _compact(detail)
@@ -859,6 +969,17 @@ def describe_call(call: ToolCall) -> str:
             "hibernate": "Hibernating the PC",
         }
         return labels.get(str(call.arguments.get("action", "")), "Controlling the PC")
+    if call.name == "read_screen":
+        return f"Reading the {call.arguments.get('scope', 'foreground')} screen"
+    if call.name == "clipboard":
+        action = str(call.arguments.get("action", "get"))
+        if action == "set":
+            return f"Copying to the clipboard: {str(call.arguments.get('text', ''))[:40]}"
+        return "Reading the clipboard"
+    if call.name == "file_operation":
+        op = str(call.arguments.get("op", "file"))
+        path = str(call.arguments.get("path", "file"))
+        return f"{op.title()}ing {path}"
     if call.name in {"type_text", "click_element"} and call.arguments.get("window"):
         target = call.arguments.get("text") if call.name == "type_text" else call.arguments.get("target")
         return f"{'Typing' if call.name == 'type_text' else 'Clicking'} {target} in {call.arguments['window']}"

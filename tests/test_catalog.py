@@ -91,8 +91,8 @@ class FastRouteTests(unittest.TestCase):
 
 
 class CatalogTests(unittest.TestCase):
-    def test_ten_tools_are_declared(self) -> None:
-        self.assertEqual(len(TOOL_SCHEMAS), 10)
+    def test_tools_are_declared(self) -> None:
+        self.assertEqual(len(TOOL_SCHEMAS), 13)
         self.assertEqual(
             ALLOWED_TOOLS,
             {
@@ -106,6 +106,9 @@ class CatalogTests(unittest.TestCase):
                 "take_screenshot",
                 "control_media",
                 "system_control",
+                "read_screen",
+                "clipboard",
+                "file_operation",
             },
         )
 

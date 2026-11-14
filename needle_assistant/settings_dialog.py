@@ -293,6 +293,16 @@ class SettingsDialog(QDialog):
             card,
         )
         grid.addWidget(self.allow_power_actions_check, 1, 1)
+        self.allow_file_access_check = QCheckBox(
+            "Allow file and clipboard operations",
+            card,
+        )
+        grid.addWidget(self.allow_file_access_check, 2, 1)
+        self.allow_any_path_check = QCheckBox(
+            "Allow paths outside Desktop/Documents/Downloads/Pictures",
+            card,
+        )
+        grid.addWidget(self.allow_any_path_check, 3, 1)
         layout.addLayout(grid)
         hint = QLabel(
             "Lock works without a confirmation. Shutdown, restart, sleep and hibernate "
@@ -375,6 +385,12 @@ class SettingsDialog(QDialog):
         )
         self.allow_power_actions_check.setChecked(
             bool(getattr(config, "allow_power_actions", True))
+        )
+        self.allow_file_access_check.setChecked(
+            bool(getattr(config, "allow_file_access", True))
+        )
+        self.allow_any_path_check.setChecked(
+            bool(getattr(config, "allow_any_path", False))
         )
         self.acrylic_check.setChecked(config.acrylic_blur)
         self.startup_check.setChecked(windows_api.is_start_with_windows() or config.start_with_windows)
@@ -486,6 +502,8 @@ class SettingsDialog(QDialog):
         updated.fast_intent = self.fast_check.isChecked()
         updated.confirm_destructive = self.confirm_destructive_check.isChecked()
         updated.allow_power_actions = self.allow_power_actions_check.isChecked()
+        updated.allow_file_access = self.allow_file_access_check.isChecked()
+        updated.allow_any_path = self.allow_any_path_check.isChecked()
         updated.acrylic_blur = self.acrylic_check.isChecked()
         updated.start_with_windows = self.startup_check.isChecked()
         updated.show_on_start = self.show_on_start_check.isChecked()

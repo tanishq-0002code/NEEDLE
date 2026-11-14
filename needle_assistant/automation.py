@@ -18,6 +18,7 @@ import psutil
 
 from . import windows_api as win
 from .catalog import normalize_keys, normalize_system_action, normalize_window_action
+from .config import load_config
 from .models import ExecutionResult, ToolCall
 from .paths import pictures_dir
 
@@ -446,6 +447,20 @@ class DesktopAutomation:
                     )
                 if call.name == "system_control":
                     return self._system_control(str(call.arguments.get("action", "")))
+                if call.name == "read_screen":
+                    return self._read_screen(str(call.arguments.get("scope", "foreground")))
+                if call.name == "clipboard":
+                    return self._clipboard(
+                        str(call.arguments.get("action", "get")),
+                        str(call.arguments.get("text", "")),
+                    )
+                if call.name == "file_operation":
+                    return self._file_operation(
+                        str(call.arguments.get("op", "")),
+                        str(call.arguments.get("path", "")),
+                        str(call.arguments.get("new_path", "")),
+                        call.arguments.get("content"),
+                    )
                 if call.name == "type_text":
                     target_hwnd = self._resolve_target_window(
                         call.arguments.get("window"), restore_hwnd
@@ -1115,6 +1130,121 @@ class DesktopAutomation:
         if not bool(powrprof.SetSuspendState(bool(hibernate), False, False)):
             raise AutomationError(f"Windows refused to {normalized} the PC.")
         return ExecutionResult(True, f"The PC is going to {normalized}.", "system_control")
+
+    def _read_screen(self, scope: str = "foreground") -> ExecutionResult:
+        try:
+            from .vision import crop_to_rect, ocr_image
+        except Exception as exc:
+            raise AutomationError(f"Screen reading is unavailable: {exc}") from exc
+        image = self._grab_screen_image()
+        scope = scope if scope in {"foreground", "full"} else "foreground"
+        title = ""
+        if scope == "foreground":
+            hwnd = win.get_foreground_window()
+            title = win.get_window_title(hwnd) if hwnd else ""
+            rect = win.get_window_rect(hwnd) if hwnd else (0, 0, *image.size)
+            image = crop_to_rect(image, rect)
+        text = ocr_image(image)
+        folder = pictures_dir()
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        path = folder / f"Needle_Screen_{stamp}.png"
+        try:
+            self._grab_screen_image().save(path, "PNG")
+        except Exception:
+            path = None
+        if not text.strip():
+            raise AutomationError("I couldn't read any text from the screen.")
+        preview = text.strip()
+        if len(preview) > 1500:
+            preview = preview[:1497] + "..."
+        message = f"Read {len(text)} characters from the {scope} screen."
+        if title:
+            message += f" (Window: {title})"
+        message += f"\n\n{preview}"
+        return ExecutionResult(True, message, "read_screen", path=str(path) if path else None)
+
+    def _clipboard(self, action: str, text: str = "") -> ExecutionResult:
+        action = action.strip().lower()
+        if action not in {"get", "set"}:
+            action = "get"
+        if action == "get":
+            try:
+                import pyperclip
+
+                value = pyperclip.paste()
+            except Exception as exc:
+                raise AutomationError(f"Could not read the clipboard: {exc}") from exc
+            value = str(value or "")
+            if not value.strip():
+                return ExecutionResult(True, "The clipboard is empty.", "clipboard")
+            preview = value if len(value) <= 1500 else value[:1497] + "..."
+            return ExecutionResult(True, f"Clipboard contents:\n{preview}", "clipboard")
+        try:
+            import pyperclip
+
+            pyperclip.copy(text)
+        except Exception as exc:
+            raise AutomationError(f"Could not write the clipboard: {exc}") from exc
+        return ExecutionResult(True, f"Copied {len(text)} characters to the clipboard.", "clipboard")
+
+    def _file_operation(self, op: str, path: str, new_path: str = "", content: Any = None) -> ExecutionResult:
+        from .config import load_config
+        from .filesystem import (
+            delete_path,
+            format_listing,
+            list_directory,
+            move_path,
+            read_text,
+            resolve_path,
+        )
+
+        cfg = load_config()
+        if not getattr(cfg, "allow_file_access", True):
+            raise AutomationError("File access is disabled in Settings.")
+        allow_any = bool(getattr(cfg, "allow_any_path", False))
+        source = resolve_path(path, allow_any=allow_any)
+        op = op.strip().lower()
+        if op == "create":
+            source.parent.mkdir(parents=True, exist_ok=True)
+            payload = "" if content is None else str(content)
+            source.write_text(payload, encoding="utf-8")
+            return ExecutionResult(True, f"Created {source} ({len(payload)} bytes).", "file_operation")
+        if op == "read":
+            if not source.exists():
+                raise AutomationError(f"File not found: {source}")
+            if source.is_dir():
+                raise AutomationError("That path is a folder. Use list instead of read.")
+            data = read_text(source)
+            return ExecutionResult(True, f"Contents of {source.name}:\n{data}", "file_operation")
+        if op == "append":
+            payload = "" if content is None else str(content)
+            source.parent.mkdir(parents=True, exist_ok=True)
+            with source.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
+            return ExecutionResult(True, f"Appended {len(payload)} characters to {source}.", "file_operation")
+        if op == "list":
+            if not source.exists():
+                raise AutomationError(f"Folder not found: {source}")
+            if not source.is_dir():
+                raise AutomationError("That path is a file. Use read instead of list.")
+            entries = list_directory(source)
+            return ExecutionResult(True, format_listing(source, entries), "file_operation")
+        if op == "rename":
+            destination = resolve_path(new_path, allow_any=allow_any)
+            if destination.exists():
+                raise AutomationError(f"Destination already exists: {destination}")
+            source.rename(destination)
+            return ExecutionResult(True, f"Renamed {source} to {destination}.", "file_operation")
+        if op == "move":
+            destination = resolve_path(new_path, allow_any=allow_any)
+            result_path = move_path(source, destination)
+            return ExecutionResult(True, f"Moved {source} to {result_path}.", "file_operation")
+        if op == "delete":
+            if not source.exists():
+                raise AutomationError(f"Path not found: {source}")
+            delete_path(source)
+            return ExecutionResult(True, f"Deleted {source}.", "file_operation")
+        raise AutomationError(f"Unsupported file operation: {op}")
 
     def _control_media(self, action: str) -> ExecutionResult:
         self._prepare_gui()
