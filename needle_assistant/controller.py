@@ -8,8 +8,10 @@ from dataclasses import replace
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QInputDialog
 
+from . import __app_name__, __version__
 from .audio import AudioEngine, list_input_devices
 from .automation import DesktopAutomation
+from .catalog import fast_route
 from .config import AppConfig, load_config, save_config
 from .hotkey import HotkeyManager, OutsideClickWatcher
 from .models import ExecutionResult, ToolCall
@@ -17,6 +19,7 @@ from .needler import NeedleRouter
 from .overlay import OverlayWindow
 from .paths import app_data_dir, sound_path
 from .settings_dialog import SettingsDialog
+from .telegram_bot import TelegramBot
 from . import windows_api
 
 log = logging.getLogger("needle.controller")
@@ -54,6 +57,7 @@ class AssistantController(QObject):
         self.hotkey = HotkeyManager()
         self.outside = OutsideClickWatcher()
         self.automation = DesktopAutomation()
+        self.telegram: TelegramBot | None = None
         self.settings: SettingsDialog | None = None
         self._session = 0
         self._foreground_hwnd = 0
@@ -61,7 +65,10 @@ class AssistantController(QObject):
         self._active = False
         self._quitting = False
         self._router_ready = False
+        self._router_error = ""
         self._audio_error = ""
+        self._telegram_status = "Off"
+        self._telegram_token = ""
 
         self.hotkey.activated.connect(self.toggle_from_hotkey)
         self.hotkey.escape_pressed.connect(self.on_escape)
@@ -95,6 +102,9 @@ class AssistantController(QObject):
             self.audio.start()
             self.hotkey.start(self.config.hotkey)
             self.outside.start()
+            self._start_telegram()
+        else:
+            self._stop_telegram("Disabled with Needle")
         self._emit_status()
         self._refresh_settings_status()
 
@@ -105,10 +115,12 @@ class AssistantController(QObject):
         try:
             self.router.load()
             self._router_ready = True
+            self._router_error = ""
             log.info("Needle 3 router is ready.")
             self.status_changed.emit("Needle Desktop — Needle 3 ready")
         except Exception as exc:
             self._router_ready = False
+            self._router_error = str(exc)
             log.exception("Needle 3 router failed to load.")
             self.notify.emit("Needle 3 is unavailable", str(exc))
         finally:
@@ -117,8 +129,13 @@ class AssistantController(QObject):
     def _emit_status(self) -> None:
         wake = "wake on" if self.config.wake_word_enabled else "wake off"
         router = "Needle 3 ready" if self.router.loaded else "warming up Needle 3"
+        telegram = ""
+        if self.config.telegram_enabled:
+            telegram = " · Telegram on" if (
+                self.telegram is not None and self.telegram.running
+            ) else " · Telegram off"
         self.status_changed.emit(
-            f"Needle Desktop — {wake} · {self.config.hotkey.upper()} · {router}"
+            f"Needle Desktop — {wake} · {self.config.hotkey.upper()} · {router}{telegram}"
         )
 
     # ------------------------------------------------------------------ trigger
@@ -348,6 +365,7 @@ class AssistantController(QObject):
                 log.exception("Could not start outside watcher.")
             self.overlay.enabled = True
             self.overlay.show_welcome()
+            self._start_telegram()
         else:
             try:
                 self.hotkey.stop()
@@ -363,6 +381,7 @@ class AssistantController(QObject):
                 pass
             self.overlay.enabled = False
             self.overlay.hide_immediately()
+            self._stop_telegram("Disabled with Needle")
         if self.settings is not None:
             self.settings.config = self.config
             try:
@@ -405,7 +424,13 @@ class AssistantController(QObject):
                     mic = label
                     break
         wake = "On · " + (self.config.wake_phrases[0] if self.config.wake_phrases else "wake word") if self.config.wake_word_enabled else "Off"
-        self.settings.set_status(needle=needle, speech=speech, microphone=mic, wake=wake)
+        self.settings.set_status(
+            needle=needle,
+            speech=speech,
+            microphone=mic,
+            wake=wake,
+            telegram=self._telegram_status,
+        )
 
     def apply_config(self, new_config: AppConfig) -> None:
         old = self.config
@@ -426,9 +451,16 @@ class AssistantController(QObject):
             self.audio.restart(self.config)
         else:
             self.audio.reload(self.config)
+        telegram_changed = (
+            old.telegram_enabled != self.config.telegram_enabled
+            or old.telegram_bot_token != self.config.telegram_bot_token
+            or old.telegram_allowed_chat_ids != self.config.telegram_allowed_chat_ids
+        )
         if old.enabled != self.config.enabled:
             self.toggle_enabled(self.config.enabled)
         else:
+            if telegram_changed:
+                self._start_telegram()
             self.config_changed.emit(self.config)
             self._emit_status()
             self._refresh_settings_status()
@@ -465,6 +497,134 @@ class AssistantController(QObject):
 
     def open_data_folder(self) -> None:
         windows_api.open_folder(app_data_dir())
+
+    # ------------------------------------------------------------------ telegram
+    def _start_telegram(self) -> None:
+        if not self.enabled:
+            self._stop_telegram("Disabled with Needle")
+            return
+        if not self.config.telegram_enabled:
+            self._stop_telegram("Off")
+            return
+        token = (self.config.telegram_bot_token or "").strip()
+        if not token:
+            self._stop_telegram("Token missing")
+            return
+        bot = self.telegram
+        if bot is not None and bot.running and self._telegram_token == token:
+            bot.update_allowed_chat_ids(self.config.telegram_allowed_chat_ids)
+            return
+        self._stop_telegram("Off")
+        bot = TelegramBot(
+            token=token,
+            allowed_chat_ids=self.config.telegram_allowed_chat_ids,
+            handler=self._execute_telegram_command,
+            status_provider=self._telegram_status_text,
+        )
+        self.telegram = bot
+        self._telegram_token = token
+        bot.status_changed.connect(self.on_telegram_status)
+        bot.start()
+
+    def _stop_telegram(self, status: str = "Off") -> None:
+        bot = self.telegram
+        self.telegram = None
+        self._telegram_token = ""
+        if bot is not None:
+            try:
+                bot.status_changed.disconnect(self.on_telegram_status)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                bot.stop(wait=2.0)
+            except Exception:
+                log.debug("Could not stop the Telegram bot cleanly.", exc_info=True)
+        self._set_telegram_status(status)
+
+    def on_telegram_status(self, status: str) -> None:
+        self._set_telegram_status(status)
+
+    def _set_telegram_status(self, status: str) -> None:
+        status = str(status or "Off")
+        if status == self._telegram_status:
+            return
+        self._telegram_status = status
+        log.info("Telegram: %s", status)
+        if not self._quitting:
+            self._refresh_settings_status()
+
+    def _telegram_status_text(self) -> str:
+        enabled = "enabled" if self.enabled else "disabled"
+        router = "ready" if self.router.loaded else (
+            "error" if self._router_error else "warming up"
+        )
+        wake = "on" if self.config.wake_word_enabled else "off"
+        mic = (
+            "system default"
+            if self.config.microphone_index is None
+            else f"device {self.config.microphone_index}"
+        )
+        return (
+            f"{__app_name__} {__version__}\n"
+            f"Enabled: {enabled}\n"
+            f"Needle 3: {router}\n"
+            f"Wake word: {wake}\n"
+            f"Microphone: {mic}\n"
+            f"Telegram: {self._telegram_status}"
+        )
+
+    def _execute_telegram_command(self, text: str) -> tuple[ToolCall, ExecutionResult]:
+        text = " ".join((text or "").split())
+        if not text:
+            message = "I didn't receive a command."
+            return (
+                ToolCall(name=None, error=message, user_text=text),
+                ExecutionResult(False, message),
+            )
+        if not self.enabled:
+            message = "Needle Desktop is disabled. Enable it in Settings."
+            return (
+                ToolCall(name=None, error=message, user_text=text),
+                ExecutionResult(False, message),
+            )
+
+        if not self.router.loaded:
+            quick = fast_route(text) if self.config.fast_intent else None
+            if quick is not None:
+                call = quick
+            elif self._router_error:
+                message = f"Needle 3 is unavailable: {self._router_error}"
+                return (
+                    ToolCall(name=None, error=message, user_text=text),
+                    ExecutionResult(False, message),
+                )
+            else:
+                message = "Needle 3 is still warming up. Try again in a moment."
+                return (
+                    ToolCall(name=None, error=message, user_text=text),
+                    ExecutionResult(False, message),
+                )
+        else:
+            call = self.router.route(text, use_fast=self.config.fast_intent)
+
+        if not call.name:
+            message = call.error or call.reasoning or "I couldn't map that to a desktop action."
+            return call, ExecutionResult(False, message, call.name or "")
+
+        log.info("Telegram command: %r -> %s", text, call.name)
+        try:
+            # Interactive actions target the window that was in front when the
+            # remote command arrived, matching the local command flow.
+            restore = windows_api.get_foreground_window()
+        except Exception:
+            restore = 0
+        try:
+            result = self.automation.execute(call, restore_hwnd=restore)
+        except Exception as exc:
+            log.exception("Telegram automation failed.")
+            result = ExecutionResult(False, f"The action failed: {exc}", call.name or "")
+        log.info("Telegram action %s finished: success=%s", call.name, result.success)
+        return call, result
 
     # ------------------------------------------------------------------ helpers
     def _capture_foreground(self) -> None:
@@ -506,6 +666,10 @@ class AssistantController(QObject):
             return
         self._quitting = True
         log.info("Shutting down Needle Desktop.")
+        try:
+            self._stop_telegram("Off")
+        except Exception:
+            pass
         try:
             self.audio.shutdown()
         except Exception:

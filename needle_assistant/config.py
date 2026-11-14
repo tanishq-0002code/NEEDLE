@@ -61,6 +61,49 @@ def normalize_wake_phrases(values: list[str] | str) -> list[str]:
     return cleaned[:8]
 
 
+def normalize_chat_ids(values: list[Any] | str | int | float | None) -> list[int]:
+    """Normalize Telegram chat IDs from a list or a comma/space separated string.
+
+    Telegram uses positive IDs for private chats and negative IDs for groups, so
+    both signs are preserved.  Duplicates and invalid entries are dropped.
+    """
+    if values is None:
+        return []
+    if isinstance(values, bool):
+        return []
+    if isinstance(values, (int, float)):
+        values = [values]
+    elif isinstance(values, str):
+        values = re.split(r"[,\s;]+", values)
+    elif not isinstance(values, (list, tuple, set)):
+        return []
+
+    cleaned: list[int] = []
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, float):
+            if not value.is_integer():
+                continue
+            number = int(value)
+        elif isinstance(value, int):
+            number = value
+        else:
+            text = str(value).strip()
+            if not text:
+                continue
+            try:
+                number = int(text)
+            except (TypeError, ValueError):
+                continue
+        if number == 0 or number in cleaned:
+            continue
+        cleaned.append(number)
+        if len(cleaned) >= 32:
+            break
+    return cleaned
+
+
 @dataclass
 class AppConfig:
     hotkey: str = DEFAULT_HOTKEY
@@ -78,12 +121,18 @@ class AppConfig:
     show_on_start: bool = True
     first_run_done: bool = False
     log_transcripts: bool = False
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_allowed_chat_ids: list[int] = field(default_factory=list)
 
     def validate(self) -> "AppConfig":
         self.hotkey = normalize_hotkey(self.hotkey)
         self.wake_phrases = normalize_wake_phrases(self.wake_phrases)
         if self.wake_word_enabled and not self.wake_phrases:
             self.wake_phrases = list(DEFAULT_WAKE_PHRASES)
+        self.telegram_enabled = bool(self.telegram_enabled)
+        self.telegram_bot_token = str(self.telegram_bot_token or "").strip()[:512]
+        self.telegram_allowed_chat_ids = normalize_chat_ids(self.telegram_allowed_chat_ids)
         if self.microphone_index is not None:
             try:
                 self.microphone_index = int(self.microphone_index)

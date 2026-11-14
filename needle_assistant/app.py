@@ -183,6 +183,19 @@ def run_selftest() -> int:
 
     _check(results, "global hotkey", hotkey_parse)
 
+    def telegram_module() -> str:
+        import certifi
+        import requests
+
+        from .telegram_bot import TelegramBot  # noqa: F401
+
+        bundle = Path(certifi.where())
+        if not bundle.exists():
+            raise FileNotFoundError(f"certifi CA bundle is missing: {bundle}")
+        return f"requests {requests.__version__}, Telegram module and CA bundle present"
+
+    _check(results, "Telegram bot module", telegram_module)
+
     router = router_holder.get("router")
     if router is not None:
         try:

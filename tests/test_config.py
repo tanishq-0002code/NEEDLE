@@ -8,6 +8,7 @@ from needle_assistant.config import (
     AppConfig,
     DEFAULT_WAKE_PHRASES,
     load_config,
+    normalize_chat_ids,
     normalize_hotkey,
     normalize_wake_phrases,
     save_config,
@@ -44,6 +45,22 @@ class WakePhraseTests(unittest.TestCase):
         self.assertEqual(normalize_wake_phrases(""), [])
 
 
+class ChatIdTests(unittest.TestCase):
+    def test_parses_mixed_input(self) -> None:
+        self.assertEqual(
+            normalize_chat_ids("123, -100456; 123 0 nope"),
+            [123, -100456],
+        )
+
+    def test_accepts_numeric_values(self) -> None:
+        self.assertEqual(normalize_chat_ids([42, "42", 7.0, True, None]), [42, 7])
+        self.assertEqual(normalize_chat_ids(123), [123])
+
+    def test_empty_input(self) -> None:
+        self.assertEqual(normalize_chat_ids(None), [])
+        self.assertEqual(normalize_chat_ids(""), [])
+
+
 class ConfigTests(unittest.TestCase):
     def test_defaults_use_four_threads(self) -> None:
         config = AppConfig()
@@ -76,6 +93,20 @@ class ConfigTests(unittest.TestCase):
     def test_unknown_keys_are_ignored(self) -> None:
         config = AppConfig.from_dict({"hotkey": "ctrl+space", "surprise": 42})
         self.assertEqual(config.hotkey, "ctrl+space")
+
+    def test_telegram_fields_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "config.json"
+            config = AppConfig(
+                telegram_enabled=True,
+                telegram_bot_token=" 123456789:ABCdef  ",
+                telegram_allowed_chat_ids=["42", -100123, "42"],
+            )
+            save_config(config, path)
+            loaded = load_config(path)
+            self.assertTrue(loaded.telegram_enabled)
+            self.assertEqual(loaded.telegram_bot_token, "123456789:ABCdef")
+            self.assertEqual(loaded.telegram_allowed_chat_ids, [42, -100123])
 
 
 if __name__ == "__main__":

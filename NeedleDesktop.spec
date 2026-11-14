@@ -51,6 +51,9 @@ for _dll in (
 # sounddevice bundles PortAudio in _sounddevice_data.
 datas += collect_data_files("_sounddevice_data")
 
+# certifi provides the CA bundle used by requests for Telegram HTTPS.
+datas += collect_data_files("certifi")
+
 # uiautomation ships the native UIAutomation client proxy DLLs under bin/.
 datas += collect_data_files("uiautomation")
 
@@ -61,6 +64,8 @@ hiddenimports = [
     "srt",
     "tqdm",
     "requests",
+    "certifi",
+    "needle_assistant.telegram_bot",
     "sounddevice",
     "_sounddevice",
     "comtypes",

@@ -1,8 +1,8 @@
 # Needle Desktop
 
-A fully offline Windows desktop voice assistant built around **Needle 3** for local intent routing. Press `Ctrl+Space` or say a wake phrase, speak a command, and a dark glass popup slides up from the taskbar, shows the live transcript, routes the request locally, and performs the action.
+A local-first Windows desktop voice assistant built around **Needle 3** for local intent routing. Press `Ctrl+Space` or say a wake phrase, speak a command, and a dark glass popup slides up from the taskbar, shows the live transcript, routes the request locally, and performs the action.
 
-No cloud APIs, no accounts, no telemetry. The microphone, speech recognition, intent model, and automation all run on the local machine.
+No cloud AI APIs, no accounts, and no telemetry. The microphone, speech recognition, intent model, and automation all run on the local machine. An optional Telegram bot lets you send the same commands from a phone; it is off by default.
 
 ## What it does
 
@@ -11,6 +11,7 @@ No cloud APIs, no accounts, no telemetry. The microphone, speech recognition, in
 - **Gemini-style popup** — frameless, translucent, always-on-top, bottom-center, with a glowing audio wave and live transcript.
 - **Local routing** — a conservative fast path handles common phrasings instantly; Needle 3 handles novel/ambiguous commands through the official Cactus engine and `needle3.cact` weights.
 - **Safe Windows execution** — app resolution with allow-listed paths, `uiautomation` element clicks, `pynput`/`pyautogui` input, foreground-window restore, and a top-left corner abort failsafe.
+- **Telegram bot (optional)** — pair your own Telegram chat and send commands such as “open Notepad” or “take a screenshot” from your phone. Off by default.
 - **Tray app** — settings, wake toggle, typed command, open data folder, start with Windows, and quit.
 
 ## Tool catalog
@@ -122,6 +123,32 @@ The frozen selftest writes its report to:
    - “Pause the music”
 6. The popup shows the parsed action badge and auto-hides about a second after execution. Click outside or press `Esc` to dismiss it.
 
+## Telegram bot (optional)
+
+The Telegram bridge is opt-in and off by default. When it is enabled, command text and results travel through Telegram's cloud, so the PC needs internet. The local voice path remains fully offline.
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy its token.
+2. Open **Needle Desktop → Settings → Telegram bot**, paste the token, and enable the bot.
+3. Save. The header badge changes from **100% OFFLINE** to **TELEGRAM ENABLED**.
+4. Send `/start` (or `/help`) to your bot. It replies with your numeric chat ID.
+5. Open Settings again, add that chat ID to **Allowed chat IDs**, and save.
+6. Send a normal message such as `open Notepad`, `type hello world`, or `take a screenshot`.
+
+The bot stays in **pairing mode** until at least one chat ID is added: it replies with the sender's chat ID but refuses to execute commands. Only listed chats can run commands. For a group, add the group's negative chat ID; Telegram's privacy mode may also require addressing the bot or disabling privacy in BotFather.
+
+Bot commands:
+
+| Command | Purpose |
+| --- | --- |
+| `/start`, `/help` | Show usage and the current chat ID |
+| `/id` | Show this chat ID |
+| `/status` | Show whether Needle, the router, wake word, and the bot are ready |
+| `/screenshot` | Capture the screen and send the image to the chat |
+
+Screenshots and command results are uploaded to Telegram; avoid using `/screenshot` on sensitive screens. The bot token is stored in `%APPDATA%\NeedleDesktop\config.json`; keep that file private and revoke the token with @BotFather if it is ever exposed.
+
+Interactive commands (`type_text`, `click_element`, `press_hotkey`) act on the window that was focused when the Telegram message arrived. The desktop must be unlocked for those actions to reach a normal window.
+
 ### Safety
 
 - Interactive actions (`type_text`, `click_element`, `press_hotkey`, `take_screenshot`) hide the popup first and restore the previously focused window.
@@ -135,6 +162,7 @@ The frozen selftest writes its report to:
 - Speech recognition uses the local Vosk `vosk-model-small-en-us-0.15` model.
 - The voice pipeline does not call any network API. Vosk’s Python package includes helper functions that reference URLs, but this app only uses its local model/DLL classes.
 - The app does not send telemetry.
+- The default voice, hotkey, and typed-command paths make no network calls. The optional Telegram bot is the only network feature: when enabled, it long-polls Telegram's Bot API and sends command text/results to the paired chat. Leave it disabled for a fully offline setup.
 
 ## Troubleshooting
 
@@ -177,6 +205,7 @@ F:\NEEDLE
 │  ├─ catalog.py                # six tools, fast path, validation
 │  ├─ automation.py             # safe Windows execution layer
 │  ├─ audio.py                  # Vosk wake word + command capture
+│  ├─ telegram_bot.py           # optional long-polling Telegram bridge
 │  ├─ overlay.py                # glass popup UI
 │  ├─ settings_dialog.py
 │  ├─ tray.py

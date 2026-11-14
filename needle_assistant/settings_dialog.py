@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -24,7 +25,13 @@ from PyQt6.QtWidgets import (
 )
 
 from .audio import list_input_devices
-from .config import AppConfig, normalize_hotkey, normalize_wake_phrases, save_config
+from .config import (
+    AppConfig,
+    normalize_chat_ids,
+    normalize_hotkey,
+    normalize_wake_phrases,
+    save_config,
+)
 from .paths import app_data_dir
 from .theme import accent_color
 from . import windows_api
@@ -46,6 +53,7 @@ class SettingsDialog(QDialog):
         self._speech_status = "Loading…"
         self._mic_status = "Checking…"
         self._wake_status = "Off"
+        self._telegram_status = "Off"
         self._build()
         self._load_values()
 
@@ -59,18 +67,16 @@ class SettingsDialog(QDialog):
         title_box.setSpacing(2)
         title = QLabel("Needle Desktop", self)
         title.setObjectName("Title")
-        subtitle = QLabel("Private, local voice control for Windows. No cloud. No API keys.", self)
+        subtitle = QLabel(
+            "Local-first voice control for Windows. Telegram is optional and off by default.",
+            self,
+        )
         subtitle.setObjectName("Subtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
-        badge = QLabel("100% OFFLINE", self)
-        badge.setStyleSheet(
-            f"background: rgba({accent_color('#8B7CFF').red()}, {accent_color('#8B7CFF').green()}, "
-            f"{accent_color('#8B7CFF').blue()}, 30); color: #A79EFF; border: 1px solid rgba(255,255,255,24);"
-            "border-radius: 10px; padding: 5px 10px; font-size: 9px; font-weight: 700;"
-        )
-        header.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+        self.badge = QLabel("100% OFFLINE", self)
+        header.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
         root.addLayout(header)
 
         scroll = QScrollArea(self)
@@ -84,6 +90,7 @@ class SettingsDialog(QDialog):
         content_layout.addWidget(self._build_how_to())
         content_layout.addWidget(self._build_status())
         content_layout.addWidget(self._build_controls())
+        content_layout.addWidget(self._build_telegram())
         content_layout.addStretch(1)
         scroll.setWidget(content)
         root.addWidget(scroll, 1)
@@ -134,10 +141,11 @@ class SettingsDialog(QDialog):
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(7)
         steps = [
-            ("1", "Press Ctrl+Space anywhere, or say “Hey Jarvis”."),
+            ("1", "Press Ctrl+Space anywhere, or say “Hey Needle”."),
             ("2", "Speak a command, for example “open Chrome” or “type hello world”."),
             ("3", "Needle 3 routes the command locally and performs the desktop action."),
             ("4", "Press Esc, click outside, or wait for the automatic dismissal."),
+            ("5", "Optional: enable the Telegram bot below to send commands from your phone."),
         ]
         for row, (number, text) in enumerate(steps):
             number_label = QLabel(number, card)
@@ -164,11 +172,13 @@ class SettingsDialog(QDialog):
         self.speech_value = QLabel("Loading…", card)
         self.mic_value = QLabel("Checking…", card)
         self.wake_value = QLabel("Off", card)
+        self.telegram_value = QLabel("Off", card)
         rows = [
             ("Needle 3 router", self.needle_value),
             ("Offline speech model", self.speech_value),
             ("Microphone", self.mic_value),
             ("Wake word", self.wake_value),
+            ("Telegram bot", self.telegram_value),
         ]
         for row, (label, value) in enumerate(rows):
             key = QLabel(label, card)
@@ -239,10 +249,62 @@ class SettingsDialog(QDialog):
         grid.addWidget(self.tokens_spin, 8, 1)
 
         grid.addWidget(self._label("Enable Needle"), 9, 0)
-        self.enable_check = QCheckBox("Enable Needle Desktop (listening, hotkey, and wake word)", card)
+        self.enable_check = QCheckBox(
+            "Enable Needle Desktop (listening, hotkey, wake word, and Telegram)",
+            card,
+        )
         grid.addWidget(self.enable_check, 9, 1)
         layout.addLayout(grid)
         return card
+
+    def _build_telegram(self) -> QFrame:
+        card, layout = self._card(
+            "Telegram bot (optional)",
+            "Control Needle from a Telegram chat. This uses Telegram's cloud, so it needs "
+            "internet and is off by default. Local voice control stays offline.",
+        )
+        self.telegram_check = QCheckBox("Enable the Telegram bot", card)
+        self.telegram_check.toggled.connect(self._update_badge)
+        layout.addWidget(self.telegram_check)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(9)
+        grid.setColumnStretch(1, 1)
+
+        grid.addWidget(self._label("Bot token"), 0, 0)
+        self.telegram_token_edit = QLineEdit(card)
+        self.telegram_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.telegram_token_edit.setPlaceholderText("123456789:ABCdef...")
+        grid.addWidget(self.telegram_token_edit, 0, 1)
+
+        self.telegram_show_token = QCheckBox("Show token", card)
+        self.telegram_show_token.toggled.connect(self._toggle_token_visibility)
+        grid.addWidget(self.telegram_show_token, 1, 1)
+
+        grid.addWidget(self._label("Allowed chat IDs"), 2, 0)
+        self.telegram_ids_edit = QLineEdit(card)
+        self.telegram_ids_edit.setPlaceholderText("123456789, -1001234567890")
+        grid.addWidget(self.telegram_ids_edit, 2, 1)
+
+        layout.addLayout(grid)
+        hint = QLabel(
+            'Create a bot with <a href="https://t.me/BotFather">@BotFather</a>, paste its '
+            "token here, then send <code>/start</code> to the bot. It replies with your "
+            "chat ID; add that ID above so only you can run commands. Until an ID is "
+            "added, the bot stays in pairing mode and ignores commands.",
+            card,
+        )
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        hint.setOpenExternalLinks(True)
+        layout.addWidget(hint)
+        return card
+
+    def _toggle_token_visibility(self, visible: bool) -> None:
+        mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        self.telegram_token_edit.setEchoMode(mode)
 
     @staticmethod
     def _label(text: str) -> QLabel:
@@ -263,7 +325,32 @@ class SettingsDialog(QDialog):
         self.startup_check.setChecked(windows_api.is_start_with_windows() or config.start_with_windows)
         self.show_on_start_check.setChecked(config.show_on_start)
         self.tokens_spin.setValue(config.max_new_tokens)
+        self.telegram_check.setChecked(config.telegram_enabled)
+        self.telegram_token_edit.setText(config.telegram_bot_token)
+        self.telegram_show_token.setChecked(False)
+        self.telegram_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.telegram_ids_edit.setText(
+            ", ".join(str(value) for value in config.telegram_allowed_chat_ids)
+        )
+        self._update_badge(config.telegram_enabled)
         self._update_status_labels()
+
+    def _update_badge(self, telegram_enabled: bool) -> None:
+        if telegram_enabled:
+            self.badge.setText("TELEGRAM ENABLED")
+            self.badge.setStyleSheet(
+                "background: rgba(255, 184, 107, 28); color: #FFD3A3;"
+                "border: 1px solid rgba(255,184,107,70); border-radius: 10px;"
+                "padding: 5px 10px; font-size: 9px; font-weight: 700;"
+            )
+            return
+        accent = accent_color("#8B7CFF")
+        self.badge.setText("100% OFFLINE")
+        self.badge.setStyleSheet(
+            f"background: rgba({accent.red()}, {accent.green()}, {accent.blue()}, 30);"
+            "color: #A79EFF; border: 1px solid rgba(255,255,255,24);"
+            "border-radius: 10px; padding: 5px 10px; font-size: 9px; font-weight: 700;"
+        )
 
     @staticmethod
     def _qt_hotkey(value: str) -> str:
@@ -286,7 +373,8 @@ class SettingsDialog(QDialog):
         return "+".join(parts)
 
     def set_status(self, needle: str | None = None, speech: str | None = None,
-                   microphone: str | None = None, wake: str | None = None) -> None:
+                   microphone: str | None = None, wake: str | None = None,
+                   telegram: str | None = None) -> None:
         if needle is not None:
             self._needle_status = needle
         if speech is not None:
@@ -295,6 +383,8 @@ class SettingsDialog(QDialog):
             self._mic_status = microphone
         if wake is not None:
             self._wake_status = wake
+        if telegram is not None:
+            self._telegram_status = telegram
         self._update_status_labels()
 
     def _update_status_labels(self) -> None:
@@ -303,12 +393,20 @@ class SettingsDialog(QDialog):
             (getattr(self, "speech_value", None), self._speech_status),
             (getattr(self, "mic_value", None), self._mic_status),
             (getattr(self, "wake_value", None), self._wake_status),
+            (getattr(self, "telegram_value", None), self._telegram_status),
         ):
             if label is None:
                 continue
             label.setText(text)
-            good = any(word in text.lower() for word in ("ready", "on", "default", "listening", "loaded"))
-            bad = any(word in text.lower() for word in ("error", "missing", "failed", "unavailable", "off"))
+            good = any(
+                word in text.lower()
+                for word in ("ready", "on", "default", "listening", "loaded", "connected")
+            )
+            bad = any(
+                word in text.lower()
+                for word in ("error", "missing", "failed", "unavailable", "off",
+                             "invalid", "another instance")
+            )
             color = "#4EE8DC" if good and not bad else "#FF8E9B" if bad else "#D9DCEC"
             label.setStyleSheet(f"color: {color}; font-weight: 600;")
 
@@ -334,6 +432,27 @@ class SettingsDialog(QDialog):
         updated.start_with_windows = self.startup_check.isChecked()
         updated.show_on_start = self.show_on_start_check.isChecked()
         updated.max_new_tokens = self.tokens_spin.value()
+        telegram_token = self.telegram_token_edit.text().strip()
+        telegram_ids = normalize_chat_ids(self.telegram_ids_edit.text())
+        if self.telegram_check.isChecked():
+            if not telegram_token:
+                QMessageBox.warning(
+                    self,
+                    "Telegram token required",
+                    "Paste the bot token from @BotFather, or turn the Telegram bot off.",
+                )
+                return
+            if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", telegram_token):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Telegram token",
+                    "That does not look like a Telegram bot token. It should look like "
+                    "123456789:ABCdef...",
+                )
+                return
+        updated.telegram_enabled = self.telegram_check.isChecked()
+        updated.telegram_bot_token = telegram_token
+        updated.telegram_allowed_chat_ids = telegram_ids
         updated.first_run_done = True
         updated.validate()
         if not windows_api.set_start_with_windows(updated.start_with_windows):
