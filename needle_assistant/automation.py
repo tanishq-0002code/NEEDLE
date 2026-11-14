@@ -1501,55 +1501,77 @@ class DesktopAutomation:
             if not hwnd:
                 raise AutomationError("No browser window was found. Open a browser first.")
             win.focus_window(hwnd)
-            time.sleep(0.25)
-            try:
-                import comtypes
-                import uiautomation as auto
+            time.sleep(0.3)
 
-                comtypes.CoInitialize()
-                try:
-                    root = auto.ControlFromHandle(hwnd)
-                    if root is None:
-                        root = auto.GetRootControl()
-                    links: list = []
-                    skip_substrings = (
-                        "google", "more", "settings", "help", "sign in",
-                        "images", "videos", "maps", "news", "shopping",
+            # Copy the address bar by focusing it and selecting/copying.
+            import pyperclip, urllib.parse
+            from pynput.keyboard import Controller, Key
+
+            previous_clipboard = pyperclip.paste()
+            controller = Controller()
+            with controller.pressed(Key.ctrl):
+                controller.press("l")
+                controller.release("l")
+            time.sleep(0.25)
+            with controller.pressed(Key.ctrl):
+                controller.press("a")
+                controller.release("a")
+            time.sleep(0.1)
+            with controller.pressed(Key.ctrl):
+                controller.press("c")
+                controller.release("c")
+            time.sleep(0.25)
+            address = pyperclip.paste()
+            pyperclip.copy(previous_clipboard)
+
+            if not address or not re.match(r"^https?://", address, re.I):
+                raise AutomationError("Could not read the browser's address bar.")
+            if "search" not in address.lower():
+                raise AutomationError(
+                    "'Open first link' is only supported on a search results page."
+                )
+
+            try:
+                import requests
+                from bs4 import BeautifulSoup
+                import urllib.parse
+
+                parsed = urllib.parse.urlparse(address)
+                query_dict = urllib.parse.parse_qs(parsed.query)
+                query = query_dict.get("q", [""])[0]
+                if not query:
+                    raise AutomationError(
+                        "Could not find a search query in the address bar. "
+                        "Search for something first, then ask again."
                     )
 
-                    def _walk(node, depth):
-                        try:
-                            children = node.GetChildren()
-                        except Exception:
-                            children = []
-                        for child in children:
-                            try:
-                                ctype = (child.ControlTypeName or "").lower()
-                                name = (child.Name or "").strip()
-                                if "hyperlink" in ctype:
-                                    lower = name.lower()
-                                    if name and not any(s in lower for s in skip_substrings):
-                                        links.append(child)
-                            except Exception:
-                                pass
-                            if depth < 6:
-                                _walk(child, depth + 1)
-
-                    _walk(root, 0)
-                finally:
-                    comtypes.CoUninitialize()
+                search_url = "https://www.bing.com/search?q=" + urllib.parse.quote(query)
+                response = requests.get(
+                    search_url,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0 Safari/537.36"
+                        )
+                    },
+                    timeout=(10.0, 30.0),
+                )
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, "html.parser")
+                link = soup.select_one("li.b_algo h2 a")
+                if not link:
+                    raise AutomationError("No result link was found on the search page.")
+                first_link = link.get("href")
+                if not first_link:
+                    raise AutomationError("No result link was found on the search page.")
+                try:
+                    os.startfile(first_link)
+                except AttributeError:
+                    subprocess.Popen([first_link], close_fds=True)
+                return ExecutionResult(True, f"Opened the first result: {first_link}", "browser_control")
             except Exception as exc:
-                raise AutomationError(f"Could not read page links: {exc}") from exc
-            if not links:
-                raise AutomationError("No hyperlink was found on the page. The page may not have loaded.")
-            first = links[0]
-            try:
-                point = first.GetClickablePoint()
-                x, y = int(point.x), int(point.y)
-            except Exception:
-                raise AutomationError("Could not select the first link's clickable point.")
-            self._mouse_click(x, y)
-            return ExecutionResult(True, "Clicked the first link on the page.", "browser_control")
+                raise AutomationError(f"Could not open the first result: {exc}") from exc
         if action == "tab_close":
             target = str(target or "").strip()
             if target:
