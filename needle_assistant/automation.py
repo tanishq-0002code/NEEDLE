@@ -461,6 +461,17 @@ class DesktopAutomation:
                         str(call.arguments.get("new_path", "")),
                         call.arguments.get("content"),
                     )
+                if call.name == "run_command":
+                    return self._run_command(
+                        str(call.arguments.get("command", "")),
+                        int(call.arguments.get("timeout", 15)),
+                    )
+                if call.name == "browser_control":
+                    return self._browser_control(
+                        str(call.arguments.get("action", "")),
+                        str(call.arguments.get("url", "")),
+                        str(call.arguments.get("browser", "")),
+                    )
                 if call.name == "type_text":
                     target_hwnd = self._resolve_target_window(
                         call.arguments.get("window"), restore_hwnd
@@ -1245,6 +1256,225 @@ class DesktopAutomation:
             delete_path(source)
             return ExecutionResult(True, f"Deleted {source}.", "file_operation")
         raise AutomationError(f"Unsupported file operation: {op}")
+
+    def _run_command(self, command: str, timeout: int = 15) -> ExecutionResult:
+        from .config import load_config
+
+        cfg = load_config()
+        if not getattr(cfg, "allow_shell", False):
+            raise AutomationError("Shell commands are disabled in Settings.")
+        command = str(command or "").strip()
+        if not command:
+            raise AutomationError("No command was provided.")
+        if any(ch in command for ch in ("|", ">", "<", "&", ";", "`", "$(")):
+            raise AutomationError(
+                "Shell metacharacters (pipes, redirects, &) are not allowed."
+            )
+        try:
+            import shlex
+
+            argv = shlex.split(command, posix=False)
+        except ValueError as exc:
+            raise AutomationError(f"Could not parse the command: {exc}") from exc
+        if not argv:
+            raise AutomationError("No command was provided.")
+        exe_name = Path(argv[0]).name.lower()
+        if exe_name.endswith(".exe"):
+            exe_name = exe_name[:-4]
+        allowed = {
+            "ipconfig", "ping", "tracert", "nslookup", "hostname", "whoami",
+            "systeminfo", "tasklist", "where", "find", "findstr", "more", "sort",
+            "fc", "python", "pip", "node", "npm", "git", "winget", "dotnet",
+            "java", "javac", "gcc", "g++", "make", "cmake", "docker", "kubectl",
+            "curl", "wget",
+        }
+        if exe_name not in allowed:
+            raise AutomationError(
+                f"'{exe_name}' is not in the allowed command list."
+            )
+        lowered = command.lower()
+        blocked = [
+            "format ", "del /", "rd /s", "rmdir /s", "shutdown", "restart-computer",
+            "stop-computer", "reg delete", "reg add", "net user", "net localgroup",
+            "takeown", "icacls", "cipher /w", "diskpart", "bcdedit", "bootrec",
+            "invoke-expression", "iex ", "downloadstring", "downloadfile",
+            "start-bitstransfer", "certutil -decode", "bitsadmin",
+            "wmic process call create", "remove-item -recurse", "rm -rf", "rm -r /",
+        ]
+        for pattern in blocked:
+            if pattern in lowered:
+                raise AutomationError(f"Blocked dangerous command pattern: {pattern}")
+        if exe_name in {"python", "node"}:
+            for arg in argv[1:]:
+                if arg.lower() in {"-c", "-e", "--eval", "--exec"}:
+                    raise AutomationError(
+                        "Inline code execution via the shell is not allowed."
+                    )
+        timeout = max(1, min(60, int(timeout or 15)))
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                shell=False,
+                creationflags=creationflags,
+            )
+        except subprocess.TimeoutExpired:
+            raise AutomationError(f"Command timed out after {timeout}s.")
+        except FileNotFoundError:
+            raise AutomationError(f"Command not found: {argv[0]}")
+        output = (proc.stdout or "")
+        if proc.stderr:
+            output = output + ("\n" if output else "") + proc.stderr
+        output = output.strip()
+        if len(output) > 3000:
+            output = output[:2997] + "..."
+        success = proc.returncode == 0
+        if output:
+            message = f"Exit code {proc.returncode}.\n{output}"
+        else:
+            message = f"Exit code {proc.returncode} (no output)."
+        return ExecutionResult(success, message, "run_command", detail=f"argv={argv}")
+
+    _BROWSER_PROCESSES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe"}
+
+    def _find_browser_window(self, browser: str | None) -> int:
+        wanted_proc = None
+        if browser:
+            name = browser.strip().lower()
+            known = {
+                "chrome": "chrome.exe",
+                "google chrome": "chrome.exe",
+                "edge": "msedge.exe",
+                "microsoft edge": "msedge.exe",
+                "firefox": "firefox.exe",
+                "brave": "brave.exe",
+                "opera": "opera.exe",
+            }
+            wanted_proc = known.get(name, name if name.endswith(".exe") else name + ".exe")
+        for info in win.enumerate_windows():
+            if not info.title.strip():
+                continue
+            if wanted_proc:
+                try:
+                    proc_name = psutil.Process(info.pid).name().lower()
+                except psutil.Error:
+                    proc_name = ""
+                if proc_name != wanted_proc.lower():
+                    continue
+                return info.hwnd
+            try:
+                proc_name = psutil.Process(info.pid).name().lower()
+            except psutil.Error:
+                proc_name = ""
+            if proc_name in self._BROWSER_PROCESSES:
+                return info.hwnd
+        return 0
+
+    def _browser_control(self, action: str, url: str = "", browser: str = "") -> ExecutionResult:
+        action = (action or "").strip().lower()
+        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page"}:
+            raise AutomationError("Unsupported browser action.")
+        if action == "open_url":
+            url = str(url or "").strip()
+            if not url:
+                raise AutomationError("A URL is required.")
+            if not re.match(r"^(https?|file|mailto)://", url, re.I):
+                if re.match(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", url, re.I):
+                    url = "https://" + url
+                else:
+                    raise AutomationError("Only http, https, file, or mailto URLs are allowed.")
+            if browser:
+                resolved = self._resolver.resolve(browser)
+                if resolved.kind == "exe" and Path(resolved.target).exists():
+                    subprocess.Popen(
+                        [resolved.target, url],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return ExecutionResult(True, f"Opened {url} in {resolved.display_name}.", "browser_control")
+            try:
+                os.startfile(url)  # type: ignore[attr-defined]
+            except OSError as exc:
+                raise AutomationError(f"Could not open the URL: {exc}") from exc
+            return ExecutionResult(True, f"Opened {url}.", "browser_control")
+
+        hwnd = self._find_browser_window(browser or None)
+        if not hwnd:
+            raise AutomationError("No browser window was found. Open a browser first.")
+        win.focus_window(hwnd)
+        time.sleep(0.2)
+        from pynput.keyboard import Controller, Key
+
+        controller = Controller()
+        if action == "tab_next":
+            with controller.pressed(Key.ctrl):
+                controller.press(Key.tab)
+                controller.release(Key.tab)
+            return ExecutionResult(True, "Switched to the next tab.", "browser_control")
+        if action == "tab_prev":
+            with controller.pressed(Key.ctrl, Key.shift):
+                controller.press(Key.tab)
+                controller.release(Key.tab)
+            return ExecutionResult(True, "Switched to the previous tab.", "browser_control")
+        if action == "tab_close":
+            with controller.pressed(Key.ctrl):
+                controller.press("w")
+                controller.release("w")
+            return ExecutionResult(True, "Closed the current tab.", "browser_control")
+        if action == "tab_new":
+            with controller.pressed(Key.ctrl):
+                controller.press("t")
+                controller.release("t")
+            return ExecutionResult(True, "Opened a new tab.", "browser_control")
+
+        # read_page
+        text = ""
+        try:
+            import comtypes
+            import uiautomation as auto
+
+            comtypes.CoInitialize()
+            try:
+                root = auto.ControlFromHandle(hwnd)
+                if root is not None:
+                    doc = root.Control(searchDepth=8, ControlType=auto.ControlType.DocumentControl)
+                    if doc is not None and doc.Exists(0.5):
+                        try:
+                            pattern = doc.GetValuePattern()
+                            if pattern is not None:
+                                text = str(pattern.Value or "")
+                        except Exception:
+                            text = ""
+                        if not text:
+                            try:
+                                text = str(doc.Name or "")
+                            except Exception:
+                                text = ""
+            finally:
+                comtypes.CoUninitialize()
+        except Exception:
+            text = ""
+        if not text.strip():
+            try:
+                rect = win.get_window_rect(hwnd)
+                from PIL import Image
+
+                full = self._grab_screen_image()
+                cropped = full.crop((rect[0], rect[1], rect[2], rect[3]))
+                from .vision import ocr_image
+
+                text = ocr_image(cropped)
+            except Exception as exc:
+                raise AutomationError(f"Could not read the page: {exc}") from exc
+        text = text.strip()
+        if not text:
+            raise AutomationError("No readable text was found on the page.")
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+        return ExecutionResult(True, f"Page text:\n{text}", "browser_control")
 
     def _control_media(self, action: str) -> ExecutionResult:
         self._prepare_gui()

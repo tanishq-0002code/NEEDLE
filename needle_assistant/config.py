@@ -127,6 +127,7 @@ class AppConfig:
     allow_power_actions: bool = True
     allow_file_access: bool = True
     allow_any_path: bool = False
+    allow_shell: bool = False
     telegram_enabled: bool = False
     telegram_bot_token: str = ""
     telegram_allowed_chat_ids: list[int] = field(default_factory=list)
@@ -141,6 +142,7 @@ class AppConfig:
         self.allow_power_actions = bool(self.allow_power_actions)
         self.allow_file_access = bool(self.allow_file_access)
         self.allow_any_path = bool(self.allow_any_path)
+        self.allow_shell = bool(self.allow_shell)
         self.telegram_bot_token = str(self.telegram_bot_token or "").strip()[:512]
         self.telegram_allowed_chat_ids = normalize_chat_ids(self.telegram_allowed_chat_ids)
         if self.microphone_index is not None:

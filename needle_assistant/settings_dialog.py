@@ -303,6 +303,11 @@ class SettingsDialog(QDialog):
             card,
         )
         grid.addWidget(self.allow_any_path_check, 3, 1)
+        self.allow_shell_check = QCheckBox(
+            "Allow shell commands (run_command tool)",
+            card,
+        )
+        grid.addWidget(self.allow_shell_check, 4, 1)
         layout.addLayout(grid)
         hint = QLabel(
             "Lock works without a confirmation. Shutdown, restart, sleep and hibernate "
@@ -391,6 +396,9 @@ class SettingsDialog(QDialog):
         )
         self.allow_any_path_check.setChecked(
             bool(getattr(config, "allow_any_path", False))
+        )
+        self.allow_shell_check.setChecked(
+            bool(getattr(config, "allow_shell", False))
         )
         self.acrylic_check.setChecked(config.acrylic_blur)
         self.startup_check.setChecked(windows_api.is_start_with_windows() or config.start_with_windows)
@@ -504,6 +512,7 @@ class SettingsDialog(QDialog):
         updated.allow_power_actions = self.allow_power_actions_check.isChecked()
         updated.allow_file_access = self.allow_file_access_check.isChecked()
         updated.allow_any_path = self.allow_any_path_check.isChecked()
+        updated.allow_shell = self.allow_shell_check.isChecked()
         updated.acrylic_blur = self.acrylic_check.isChecked()
         updated.start_with_windows = self.startup_check.isChecked()
         updated.show_on_start = self.show_on_start_check.isChecked()

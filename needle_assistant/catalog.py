@@ -187,6 +187,39 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["op", "path"],
         },
     },
+    {
+        "name": "run_command",
+        "description": "Run a shell command and return its output",
+        "triggers": [r"^(?:please\s+)?(?:run|execute|shell)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer"},
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "browser_control",
+        "description": "Open a URL or control browser tabs",
+        "triggers": [
+            r"\b(?:open (?:the )?(?:url|website|page|link)|go to (?:the )?(?:url|website|page|link))\b",
+            r"\b(?:new tab|close tab|next tab|previous tab)\b",
+        ],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page"],
+                },
+                "url": {"type": "string"},
+                "browser": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
 ]
 
 SYSTEM_PROMPT = "device: Windows desktop"
@@ -658,6 +691,33 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         if op in {"rename", "move"} and not new_path:
             raise ValueError("A destination path is required.")
         return name, result
+    if name == "run_command":
+        command = str(arguments.get("command", "")).strip()
+        if not command:
+            raise ValueError("A command is required.")
+        if len(command) > 2000:
+            raise ValueError("The command is too long.")
+        timeout = arguments.get("timeout", 15)
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            timeout = 15
+        timeout = max(1, min(60, timeout))
+        return name, {"command": command, "timeout": timeout}
+    if name == "browser_control":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page"}:
+            action = "open_url" if str(arguments.get("url", "")).strip() else "read_page"
+        result = {"action": action}
+        url = str(arguments.get("url", "")).strip()
+        if url:
+            result["url"] = url
+        browser = str(arguments.get("browser", "")).strip()
+        if browser:
+            result["browser"] = browser
+        if action == "open_url" and not url:
+            raise ValueError("A URL is required.")
+        return name, result
     if name == "press_hotkey":
         raw_keys = arguments.get("keys", [])
         try:
@@ -873,6 +933,8 @@ def is_destructive(call: ToolCall) -> bool:
         return bool(call.arguments.get("force"))
     if call.name == "file_operation":
         return str(call.arguments.get("op", "")).lower() in {"delete", "rename", "move"}
+    if call.name == "run_command":
+        return True
     return False
 
 
@@ -895,6 +957,8 @@ def destructive_description(call: ToolCall) -> str:
         op = str(call.arguments.get("op", ""))
         path = str(call.arguments.get("path", "the file"))
         return f"{op} {path}"
+    if call.name == "run_command":
+        return f"run shell command: {str(call.arguments.get('command', ''))[:80]}"
     return "run this action"
 
 
@@ -928,6 +992,12 @@ def badge_text(call: ToolCall) -> str:
         detail = str(call.arguments.get("action", ""))
     elif call.name == "file_operation":
         detail = f"{call.arguments.get('op', '')} {call.arguments.get('path', '')}".strip()
+    elif call.name == "run_command":
+        detail = str(call.arguments.get("command", ""))
+    elif call.name == "browser_control":
+        detail = str(call.arguments.get("action", ""))
+        if call.arguments.get("url"):
+            detail = f"{detail} {call.arguments['url']}"
     if call.name in {"type_text", "click_element"} and call.arguments.get("window"):
         detail = f"{detail} → {call.arguments['window']}"
     detail = _compact(detail)
@@ -980,6 +1050,14 @@ def describe_call(call: ToolCall) -> str:
         op = str(call.arguments.get("op", "file"))
         path = str(call.arguments.get("path", "file"))
         return f"{op.title()}ing {path}"
+    if call.name == "run_command":
+        return f"Running: {str(call.arguments.get('command', ''))[:60]}"
+    if call.name == "browser_control":
+        action = str(call.arguments.get("action", ""))
+        url = str(call.arguments.get("url", ""))
+        if url:
+            return f"Browser: {action} {url}"
+        return f"Browser: {action}"
     if call.name in {"type_text", "click_element"} and call.arguments.get("window"):
         target = call.arguments.get("text") if call.name == "type_text" else call.arguments.get("target")
         return f"{'Typing' if call.name == 'type_text' else 'Clicking'} {target} in {call.arguments['window']}"
