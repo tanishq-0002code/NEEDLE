@@ -1565,6 +1565,23 @@ class DesktopAutomation:
                 first_link = link.get("href")
                 if not first_link:
                     raise AutomationError("No result link was found on the search page.")
+                # Bing wraps results in a redirect URL with the destination
+                # base64-encoded in a `u=a1` query parameter. Decode it so the
+                # link opens directly instead of going through Bing's redirect.
+                from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs, unquote as _unquote
+                import base64 as _base64
+
+                try:
+                    redirect_query = _parse_qs(_urlparse(first_link).query)
+                    encoded = (redirect_query.get("u") or [""])[0]
+                    if encoded.startswith("a1"):
+                        raw = encoded[2:]
+                        padding = "=" * (-len(raw) % 4)
+                        destination = _base64.b64decode(raw + padding).decode("utf-8", "ignore")
+                        if destination.startswith("http"):
+                            first_link = destination
+                except Exception:
+                    pass
                 try:
                     os.startfile(first_link)
                 except AttributeError:
