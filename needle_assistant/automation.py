@@ -471,6 +471,7 @@ class DesktopAutomation:
                         str(call.arguments.get("action", "")),
                         str(call.arguments.get("url", "")),
                         str(call.arguments.get("browser", "")),
+                        str(call.arguments.get("target", "")),
                     )
                 if call.name == "memory":
                     return self._memory(
@@ -1417,7 +1418,7 @@ class DesktopAutomation:
                 return info.hwnd
         return 0
 
-    def _browser_control(self, action: str, url: str = "", browser: str = "") -> ExecutionResult:
+    def _browser_control(self, action: str, url: str = "", browser: str = "", target: str = "") -> ExecutionResult:
         action = (action or "").strip().lower()
         if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page"}:
             raise AutomationError("Unsupported browser action.")
@@ -1464,9 +1465,36 @@ class DesktopAutomation:
                 controller.release(Key.tab)
             return ExecutionResult(True, "Switched to the previous tab.", "browser_control")
         if action == "tab_close":
+            target = str(target or "").strip()
+            if target:
+                # Select the named tab first, then close it.
+                try:
+                    import comtypes
+                    import uiautomation as auto
+
+                    comtypes.CoInitialize()
+                    try:
+                        hwnd = self._find_browser_window(browser or None)
+                        root = auto.ControlFromHandle(hwnd) if hwnd else auto.GetRootControl()
+                        if root is not None:
+                            tab = root.Control(searchDepth=8, SubName=target)
+                            if tab is None or not tab.Exists(0.5):
+                                tab = root.Control(searchDepth=8, Name=target)
+                            if tab is not None and tab.Exists(0.5):
+                                try:
+                                    tab.SetFocus()
+                                except Exception:
+                                    pass
+                                time.sleep(0.15)
+                    finally:
+                        comtypes.CoUninitialize()
+                except Exception:
+                    pass
             with controller.pressed(Key.ctrl):
                 controller.press("w")
                 controller.release("w")
+            if target:
+                return ExecutionResult(True, f"Closed the tab matching '{target}'.", "browser_control")
             return ExecutionResult(True, "Closed the current tab.", "browser_control")
         if action == "tab_new":
             with controller.pressed(Key.ctrl):

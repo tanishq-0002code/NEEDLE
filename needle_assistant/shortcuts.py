@@ -48,18 +48,18 @@ def match(text: str) -> tuple[str, list[str]] | None:
         trigger_clean = " ".join(str(trigger or "").split()).lower()
         if not trigger_clean or not steps:
             continue
-        # Substring containment: trigger phrase contained in input.
+        # Substring containment either way.
         if trigger_clean in cleaned or cleaned in trigger_clean:
             return trigger, list(steps)
-        # Token overlap.
         t_tokens = set(trigger_clean.split())
         c_tokens = set(cleaned.split())
         if t_tokens and c_tokens:
+            # Containment: all trigger words present in input.
+            if t_tokens.issubset(c_tokens):
+                return trigger, list(steps)
             overlap = len(t_tokens & c_tokens) / max(len(t_tokens), len(c_tokens))
-            if overlap > best_score and overlap >= 0.6:
-                best_score = overlap
-                best = (trigger, list(steps))
-    return best
+            if overlap >= 0.6:
+                return trigger, list(steps)
 
 
 def set_shortcut(trigger: str, steps: list[str]) -> None:

@@ -228,6 +228,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "url": {"type": "string"},
                 "browser": {"type": "string"},
+                "target": {"type": "string"},
             },
             "required": ["action"],
         },
@@ -822,6 +823,9 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         browser = str(arguments.get("browser", "")).strip()
         if browser:
             result["browser"] = browser
+        target = str(arguments.get("target", "")).strip()
+        if target:
+            result["target"] = target
         if action == "open_url" and not url:
             raise ValueError("A URL is required.")
         return name, result
@@ -981,6 +985,30 @@ def fast_route(text: str) -> ToolCall | None:
             return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                             reasoning="Matched focus-window phrase.", user_text=text)
 
+    # "open <browser> and search for X" -> navigate X in <browser>
+    browser_search = re.search(
+        r"(?:please\s+)?(?:open|launch|start)\s+(edge|chrome|firefox|brave|opera)\s+(?:and\s+)?(?:search(?:\s+for)?|go\s+to|navigate\s+to|open)\s+(.+)$",
+        cleaned,
+        re.I,
+    )
+    if browser_search:
+        browser = browser_search.group(1).lower()
+        browser = {"edge": "edge", "chrome": "chrome", "firefox": "firefox", "brave": "brave", "opera": "opera"}.get(browser, browser)
+        query = browser_search.group(2).strip().strip(".!?")
+        if query:
+            if re.match(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", query, re.I):
+                url = query if "://" in query else "https://" + query
+            else:
+                import urllib.parse
+
+                url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
+            try:
+                name, arguments = validate_call("browser_control", {"action": "open_url", "url": url, "browser": browser})
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched browser-search phrase.", user_text=text)
+
     # "search for X" / "google X" -> browser navigation
     search_match = re.search(
         r"(?:please\s+)?(?:search (?:for)?|google|look up)\s+(.+)$",
@@ -1004,6 +1032,22 @@ def fast_route(text: str) -> ToolCall | None:
                             reasoning="Matched search phrase.", user_text=text)
 
     sleep_match = _SLEEP_RE.fullmatch(cleaned)
+    # "shortcut <trigger> = <steps>" management
+    shortcut_parsed = _shortcut_from_request(text)
+    if shortcut_parsed and re.search(r"\b(?:shortcut|remember shortcut|save shortcut)\b", cleaned, re.I):
+        trigger, steps = shortcut_parsed
+        step_list = [s.strip() for s in steps.replace(";", ",").split(",") if s.strip()]
+        if not step_list:
+            step_list = [steps.strip()]
+        try:
+            name, arguments = validate_call(
+                "shortcut",
+                {"action": "save", "trigger": trigger, "steps": ",".join(step_list)},
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched shortcut-save phrase.", user_text=text)
     if sleep_match:
         try:
             name, arguments = validate_call("system_control", {"action": "sleep"})
@@ -1078,6 +1122,14 @@ def fast_route(text: str) -> ToolCall | None:
 
     focused = _focus_from_request(text)
     if focused:
+        if re.match(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", focused, re.I):
+            url = focused if "://" in focused else "https://" + focused
+            try:
+                name, arguments = validate_call("browser_control", {"action": "open_url", "url": url})
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched open-url phrase.", user_text=text)
         try:
             name, arguments = validate_call("focus_window", {"title": focused})
         except ValueError:

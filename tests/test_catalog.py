@@ -92,7 +92,7 @@ class FastRouteTests(unittest.TestCase):
 
 class CatalogTests(unittest.TestCase):
     def test_tools_are_declared(self) -> None:
-        self.assertEqual(len(TOOL_SCHEMAS), 19)
+        self.assertEqual(len(TOOL_SCHEMAS), 20)
         self.assertEqual(
             ALLOWED_TOOLS,
             {
@@ -115,6 +115,7 @@ class CatalogTests(unittest.TestCase):
                 "memory",
                 "schedule",
                 "macro",
+                "shortcut",
             },
         )
 
