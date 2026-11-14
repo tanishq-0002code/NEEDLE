@@ -234,6 +234,24 @@ class AssistantController(QObject):
             return
         if self._handle_undo(text):
             return
+        # Phrase shortcuts: "i am gonna study" -> stored step list.
+        try:
+            from . import shortcuts as _shortcuts
+
+            match = _shortcuts.match(text)
+        except Exception:
+            match = None
+        if match is not None:
+            trigger, steps = match
+            self._active = True
+            self._session += 1
+            session = self._session
+            self.overlay.set_thinking(f"Shortcut '{trigger}': {len(steps)} step(s)…")
+            thread = threading.Thread(
+                target=self._plan_worker, args=(steps, session), name="NeedlePlan", daemon=True
+            )
+            thread.start()
+            return
         if looks_like_plan(text):
             self._start_plan(text)
             return

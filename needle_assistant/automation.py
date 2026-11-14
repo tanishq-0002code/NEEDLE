@@ -494,6 +494,12 @@ class DesktopAutomation:
                         str(call.arguments.get("name", "")),
                         str(call.arguments.get("steps", "")),
                     )
+                if call.name == "shortcut":
+                    return self._shortcut(
+                        str(call.arguments.get("action", "")),
+                        str(call.arguments.get("trigger", "")),
+                        str(call.arguments.get("steps", "")),
+                    )
                 if call.name == "type_text":
                     target_hwnd = self._resolve_target_window(
                         call.arguments.get("window"), restore_hwnd
@@ -1623,6 +1629,36 @@ class DesktopAutomation:
             macros.set_macro(name, steps_list)
             return ExecutionResult(True, f"Saved macro '{name}' with {len(steps_list)} step(s).", "macro")
         raise AutomationError("Unsupported macro action.")
+
+    def _shortcut(self, action: str, trigger: str = "", steps: str = "") -> ExecutionResult:
+        from . import shortcuts
+
+        action = (action or "").strip().lower()
+        if action == "list":
+            items = shortcuts.list_shortcuts()
+            if not items:
+                return ExecutionResult(True, "No shortcuts are saved.", "shortcut")
+            lines = [f"{name}: {'; '.join(steps)}" for name, steps in sorted(items.items())]
+            return ExecutionResult(True, "Shortcuts:\n" + "\n".join(lines), "shortcut")
+        if action == "delete":
+            if not trigger:
+                raise AutomationError("Which shortcut should I delete?")
+            if shortcuts.delete(trigger):
+                return ExecutionResult(True, f"Deleted shortcut '{trigger}'.", "shortcut")
+            return ExecutionResult(False, f"No shortcut named '{trigger}'.", "shortcut")
+        if action == "save":
+            if not trigger or not steps:
+                raise AutomationError("A trigger phrase and steps are required.")
+            step_list = [part.strip() for part in steps.replace(";", ",").split(",") if part.strip()]
+            if not step_list:
+                step_list = [steps.strip()]
+            shortcuts.set_shortcut(trigger, step_list)
+            return ExecutionResult(
+                True,
+                f"Saved shortcut '{trigger}' with {len(step_list)} step(s).",
+                "shortcut",
+            )
+        raise AutomationError("Unsupported shortcut action.")
 
     def _control_media(self, action: str) -> ExecutionResult:
         self._prepare_gui()

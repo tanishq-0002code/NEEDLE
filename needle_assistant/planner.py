@@ -46,6 +46,13 @@ def split_plan(text: str) -> list[str] | None:
     if len(parts) >= 2:
         return parts
 
+    # Plain "and" between two imperative clauses.
+    if " and " in cleaned.lower():
+        candidate_parts = re.split(r"\s+and\s+", cleaned, flags=re.I)
+        candidate_parts = [part.strip(" ,.;") for part in candidate_parts if part.strip(" ,.;")]
+        if len(candidate_parts) >= 2 and all(_starts_with_verb(part) for part in candidate_parts):
+            return candidate_parts
+
     # Comma-separated imperative list (only if every part starts with a verb).
     if "," in cleaned:
         parts = [part.strip(" ,.;") for part in cleaned.split(",")]

@@ -63,6 +63,7 @@ class TelegramBot(QObject):
         confirmation_required: Callable[[ToolCall], bool] | None = None,
         executor: Callable[[str], tuple[ToolCall, ExecutionResult]] | None = None,
         confirmation_store: ConfirmationStore | None = None,
+        undo_handler: Callable[[], tuple[int, str]] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -75,6 +76,7 @@ class TelegramBot(QObject):
         self._classify = classify
         self._confirmation_required = confirmation_required
         self._confirmation_store = confirmation_store
+        self._undo_handler = undo_handler
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._session = requests.Session()
@@ -273,6 +275,18 @@ class TelegramBot(QObject):
             self._send(chat_id, "Cancelled. Nothing was changed.")
             return
 
+        if command == "/undo":
+            if self._undo_handler is None:
+                self._send(chat_id, "Undo is not available.")
+                return
+            try:
+                count, message = self._undo_handler()
+            except Exception as exc:
+                self._send(chat_id, f"Not done: {self._safe_error(exc)}")
+                return
+            self._send(chat_id, message if count else "There is nothing to undo.")
+            return
+
         if command == "/status":
             try:
                 status = self._status_provider() or "No status available."
@@ -379,6 +393,7 @@ class TelegramBot(QObject):
             "<b>Commands</b>\n"
             "/status — app, router, and bot status\n"
             "/screenshot — capture the screen and send it here\n"
+            "/undo — undo the last action\n"
             "/id — show this chat ID\n"
             "/help — this message\n"
         )

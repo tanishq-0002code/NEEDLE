@@ -278,6 +278,20 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["action"],
         },
     },
+    {
+        "name": "shortcut",
+        "description": "Save, delete, or list trigger-phrase shortcuts",
+        "triggers": [r"^(?:please\s+)?(?:shortcut|remember shortcut|save shortcut)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["save", "delete", "list"]},
+                "trigger": {"type": "string"},
+                "steps": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
 ]
 
 SYSTEM_PROMPT = "device: Windows desktop"
@@ -548,6 +562,24 @@ def _focus_from_request(text: str) -> str | None:
         return None
     title = _clean_window_title(match.group(1))
     return title or None
+
+
+def _shortcut_from_request(text: str) -> tuple[str, str] | None:
+    cleaned = _strip_polite_keepcase(text)
+    # Forms: "shortcut <trigger> = <steps>", "shortcut <trigger>: <steps>",
+    # "remember shortcut <trigger> -> <steps>".
+    match = re.search(
+        r"(?:shortcut|remember shortcut|save shortcut)\s+(.+?)\s*(?:=|:|->|→)\s*(.+)$",
+        cleaned,
+        re.I,
+    )
+    if not match:
+        return None
+    trigger = match.group(1).strip().strip("\"'")
+    steps = match.group(2).strip().strip("\"'")
+    if not trigger or not steps:
+        return None
+    return trigger, steps
 
 
 def _hotkey_from_text(text: str) -> list[str] | None:
@@ -845,6 +877,30 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         if action == "save" and "name" not in result:
             raise ValueError("A macro name is required.")
         return name, result
+    if name == "shortcut":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"save", "delete", "list"}:
+            action = "list"
+        result = {"action": action}
+        trigger = str(arguments.get("trigger", "")).strip()
+        if trigger:
+            result["trigger"] = trigger[:120]
+        steps = str(arguments.get("steps", "")).strip()
+        if steps:
+            result["steps"] = steps[:2000]
+        if action in {"save", "delete"} and "trigger" not in result:
+            parsed = _shortcut_from_request(user_text)
+            if parsed:
+                result["trigger"] = parsed[0]
+                if parsed[1]:
+                    result["steps"] = parsed[1]
+        if action == "save" and ("trigger" not in result or "steps" not in result):
+            raise ValueError(
+                "Provide a trigger phrase and steps, e.g. 'shortcut study = open edge, go to pw.live/...'."
+            )
+        if action == "delete" and "trigger" not in result:
+            raise ValueError("Which shortcut should I delete?")
+        return name, result
     if name == "press_hotkey":
         raw_keys = arguments.get("keys", [])
         try:
@@ -902,6 +958,50 @@ def fast_route(text: str) -> ToolCall | None:
         action = _MEDIA_ACTIONS[media.group(1).lower()]
         return ToolCall(name="control_media", arguments={"action": action}, source="fast",
                         confidence=1.0, reasoning="Matched media phrase.", user_text=text)
+
+    # "make X the main window" / "bring X to the front"
+    main_match = re.fullmatch(
+        r"(?:please\s+)?(?:make|set)\s+(.+?)\s+(?:the\s+)?(?:main|primary|active)\s+window",
+        cleaned,
+        re.I,
+    )
+    if not main_match:
+        main_match = re.fullmatch(
+            r"(?:please\s+)?bring\s+(.+?)\s+to\s+(?:the\s+)?(?:front|foreground)",
+            cleaned,
+            re.I,
+        )
+    if main_match:
+        title = _clean_window_title(main_match.group(1))
+        if title and title.lower() not in _GENERIC_WINDOW_TARGETS:
+            try:
+                name, arguments = validate_call("focus_window", {"title": title})
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched focus-window phrase.", user_text=text)
+
+    # "search for X" / "google X" -> browser navigation
+    search_match = re.search(
+        r"(?:please\s+)?(?:search (?:for)?|google|look up)\s+(.+)$",
+        cleaned,
+        re.I,
+    )
+    if search_match:
+        query = search_match.group(1).strip().strip(".!?")
+        if query:
+            if re.match(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", query, re.I):
+                url = query if "://" in query else "https://" + query
+            else:
+                import urllib.parse
+
+                url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
+            try:
+                name, arguments = validate_call("browser_control", {"action": "open_url", "url": url})
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched search phrase.", user_text=text)
 
     sleep_match = _SLEEP_RE.fullmatch(cleaned)
     if sleep_match:
