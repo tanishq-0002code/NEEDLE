@@ -232,6 +232,52 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["action"],
         },
     },
+    {
+        "name": "memory",
+        "description": "Remember an app alias or preference",
+        "triggers": [r"\b(?:remember|alias|preference)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["set_alias", "delete_alias", "list_aliases", "set_preference"]},
+                "alias": {"type": "string"},
+                "target": {"type": "string"},
+                "key": {"type": "string"},
+                "value": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "schedule",
+        "description": "Schedule a reminder or recurring task",
+        "triggers": [r"\b(?:remind|reminder|schedule|timer)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "list", "cancel"]},
+                "minutes": {"type": "number"},
+                "message": {"type": "string"},
+                "id": {"type": "integer"},
+                "recurring": {"type": "boolean"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "macro",
+        "description": "Save or run a named macro (sequence of commands)",
+        "triggers": [r"\b(?:macro|routine)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["save", "run", "list", "delete"]},
+                "name": {"type": "string"},
+                "steps": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
 ]
 
 SYSTEM_PROMPT = "device: Windows desktop"
@@ -747,6 +793,58 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         if action == "open_url" and not url:
             raise ValueError("A URL is required.")
         return name, result
+    if name == "memory":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"set_alias", "delete_alias", "list_aliases", "set_preference"}:
+            action = "list_aliases"
+        result = {"action": action}
+        if arguments.get("alias"):
+            result["alias"] = str(arguments.get("alias")).strip()[:80]
+        if arguments.get("target"):
+            result["target"] = str(arguments.get("target")).strip()[:120]
+        if arguments.get("key"):
+            result["key"] = str(arguments.get("key")).strip()[:80]
+        if arguments.get("value") is not None:
+            result["value"] = str(arguments.get("value"))[:500]
+        return name, result
+    if name == "schedule":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"add", "list", "cancel"}:
+            action = "list"
+        result = {"action": action}
+        if arguments.get("minutes") is not None:
+            try:
+                result["minutes"] = float(arguments.get("minutes"))
+            except (TypeError, ValueError):
+                result["minutes"] = 5.0
+        if arguments.get("message"):
+            result["message"] = str(arguments.get("message")).strip()[:300]
+        if arguments.get("id") is not None:
+            try:
+                result["id"] = int(arguments.get("id"))
+            except (TypeError, ValueError):
+                pass
+        if arguments.get("recurring") is not None:
+            result["recurring"] = bool(arguments.get("recurring"))
+        if action == "add" and "minutes" not in result:
+            result["minutes"] = 5.0
+        if action == "add" and "message" not in result:
+            result["message"] = "Reminder"
+        return name, result
+    if name == "macro":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"save", "run", "list", "delete"}:
+            action = "list"
+        result = {"action": action}
+        if arguments.get("name"):
+            result["name"] = str(arguments.get("name")).strip()[:60]
+        if arguments.get("steps") is not None:
+            result["steps"] = str(arguments.get("steps"))[:4000]
+        if action in {"run", "delete"} and "name" not in result:
+            raise ValueError("A macro name is required.")
+        if action == "save" and "name" not in result:
+            raise ValueError("A macro name is required.")
+        return name, result
     if name == "press_hotkey":
         raw_keys = arguments.get("keys", [])
         try:
@@ -1033,6 +1131,14 @@ def badge_text(call: ToolCall) -> str:
         detail = str(call.arguments.get("action", ""))
         if call.arguments.get("url"):
             detail = f"{detail} {call.arguments['url']}"
+    elif call.name == "memory":
+        detail = str(call.arguments.get("action", ""))
+    elif call.name == "schedule":
+        detail = str(call.arguments.get("action", ""))
+        if call.arguments.get("message"):
+            detail = f"{detail} {call.arguments['message']}"
+    elif call.name == "macro":
+        detail = f"{call.arguments.get('action', '')} {call.arguments.get('name', '')}".strip()
     elif call.name == "run_plan":
         steps = call.arguments.get("steps", [])
         detail = f"{len(steps) if isinstance(steps, list) else '?'} steps"
@@ -1096,6 +1202,20 @@ def describe_call(call: ToolCall) -> str:
         if url:
             return f"Browser: {action} {url}"
         return f"Browser: {action}"
+    if call.name == "memory":
+        return f"Memory: {call.arguments.get('action', 'action')}"
+    if call.name == "schedule":
+        action = str(call.arguments.get("action", ""))
+        message = str(call.arguments.get("message", ""))
+        if message:
+            return f"Schedule: {action} — {message}"
+        return f"Schedule: {action}"
+    if call.name == "macro":
+        action = str(call.arguments.get("action", ""))
+        name = str(call.arguments.get("name", ""))
+        if name:
+            return f"Macro: {action} {name}"
+        return f"Macro: {action}"
     if call.name == "run_plan":
         steps = call.arguments.get("steps", [])
         n = len(steps) if isinstance(steps, list) else 0

@@ -3,8 +3,8 @@
 # PyInstaller Windows version resource for Needle Desktop.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 2, 0, 0),
-    prodvers=(1, 2, 0, 0),
+    filevers=(1, 4, 0, 0),
+    prodvers=(1, 4, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -19,12 +19,12 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'Needle'),
           StringStruct(u'FileDescription', u'Needle Desktop - local-first Windows voice assistant'),
-          StringStruct(u'FileVersion', u'1.2.0.0'),
+          StringStruct(u'FileVersion', u'1.4.0.0'),
           StringStruct(u'InternalName', u'NeedleDesktop'),
           StringStruct(u'LegalCopyright', u'Copyright (c) 2026'),
           StringStruct(u'OriginalFilename', u'NeedleDesktop.exe'),
           StringStruct(u'ProductName', u'Needle Desktop'),
-          StringStruct(u'ProductVersion', u'1.2.0.0')
+          StringStruct(u'ProductVersion', u'1.4.0.0')
         ]
       )
     ]),

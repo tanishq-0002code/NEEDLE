@@ -18,11 +18,14 @@ from .confirmation import ConfirmationStore
 from .config import AppConfig, load_config, save_config
 from .hotkey import HotkeyManager, OutsideClickWatcher
 from .journal import UndoJournal
+from .macros import get as get_macro
+from .memory import record_history
 from .models import ExecutionResult, ToolCall
 from .needler import NeedleRouter
 from .overlay import OverlayWindow
 from .paths import app_data_dir, sound_path
 from .planner import is_transient_failure, looks_like_plan, split_plan
+from .scheduler import Scheduler
 from .settings_dialog import SettingsDialog
 from .telegram_bot import TelegramBot
 from . import windows_api
@@ -39,6 +42,7 @@ class AssistantController(QObject):
     plan_progress = pyqtSignal(str, int, int)
     plan_step_done = pyqtSignal(object, object, int, int)
     plan_done = pyqtSignal(bool, str, int)
+    scheduled_fire = pyqtSignal(str, object)
     notify = pyqtSignal(str, str)
     status_changed = pyqtSignal(str)
     config_changed = pyqtSignal(object)
@@ -68,6 +72,8 @@ class AssistantController(QObject):
         self.outside = OutsideClickWatcher()
         self.automation = DesktopAutomation()
         self.undo = UndoJournal()
+        self.scheduler = Scheduler(fire=self._on_scheduled_fire)
+        self.automation.set_scheduler(self.scheduler)
         self.telegram: TelegramBot | None = None
         self.settings: SettingsDialog | None = None
         self._session = 0
@@ -105,6 +111,7 @@ class AssistantController(QObject):
         self.plan_progress.connect(self.on_plan_progress)
         self.plan_step_done.connect(self.on_plan_step_done)
         self.plan_done.connect(self.on_plan_done)
+        self.scheduled_fire.connect(self._handle_scheduled_fire)
         self.refresh_status.connect(self._refresh_settings_status)
         self.confirm_needed.connect(self._on_confirm_needed)
 
@@ -120,6 +127,7 @@ class AssistantController(QObject):
             self.hotkey.start(self.config.hotkey)
             self.outside.start()
             self._start_telegram()
+            self.scheduler.start()
         else:
             self._stop_telegram("Disabled with Needle")
         self._emit_status()
@@ -310,7 +318,35 @@ class AssistantController(QObject):
                 return candidate
         return None
 
-    def _handle_undo(self, text: str) -> bool:
+    def _on_scheduled_fire(self, message: str, action: object) -> None:
+        try:
+            self.scheduled_fire.emit(str(message or "Reminder"), action)
+        except Exception:
+            pass
+
+    def _handle_scheduled_fire(self, message: str, action: object) -> None:
+        self.notify.emit("Reminder", str(message))
+        if action:
+            text = str(action)
+            thread = threading.Thread(
+                target=self._run_scheduled_action, args=(text,), name="NeedleScheduled", daemon=True
+            )
+            thread.start()
+
+    def _run_scheduled_action(self, text: str) -> None:
+        try:
+            call = self.router.route(text, use_fast=self.config.fast_intent)
+            if not call.name:
+                return
+            result = self.automation.execute(call, restore_hwnd=0)
+            try:
+                audit_record(call.name or "", getattr(call, "arguments", {}), result.success, result.message)
+            except Exception:
+                pass
+            if not result.success:
+                self.notify.emit("Scheduled action failed", result.message)
+        except Exception:
+            log.debug("Scheduled action failed.", exc_info=True)
         cleaned = " ".join(str(text or "").split()).lower()
         if not cleaned:
             return False
@@ -386,6 +422,33 @@ class AssistantController(QObject):
             )
             thread.start()
             return
+        if call.name == "macro" and str(call.arguments.get("action", "")).lower() == "run":
+            from .macros import get as get_macro
+
+            name = str(call.arguments.get("name", "")).strip()
+            steps = get_macro(name)
+            if not steps:
+                self.overlay.show_error(f"No macro named '{name}'.")
+                self.overlay.hide_after(2600)
+                self._play_sound("error.wav")
+                return
+            self.overlay.set_thinking(f"Running macro '{name}' ({len(steps)} steps)…")
+            thread = threading.Thread(
+                target=self._plan_worker, args=(steps, session), name="NeedlePlan", daemon=True
+            )
+            thread.start()
+            return
+        if call.name == "memory" and str(call.arguments.get("action", "")).lower() == "set_alias":
+            # Persist immediately so later app resolution uses it.
+            try:
+                from . import memory as _memory
+
+                alias = str(call.arguments.get("alias", "")).strip()
+                target = str(call.arguments.get("target", "")).strip()
+                if alias and target:
+                    _memory.set_alias(alias, target)
+            except Exception:
+                pass
         if not call.name:
             message = call.error or call.reasoning or "I couldn't map that to a desktop action."
             log.warning("Route failed: %s", message)
@@ -529,6 +592,14 @@ class AssistantController(QObject):
                 final_message = f"Step {index} failed: {result.message}"
                 overall_success = False
                 break
+        if overall_success:
+            self.automation.set_last_plan_steps(steps)
+            try:
+                from . import memory as _memory
+
+                _memory.record_history(" | ".join(steps), "run_plan")
+            except Exception:
+                pass
         self.plan_done.emit(overall_success, final_message, session)
 
     def _inverse_for(self, call: ToolCall, result: ExecutionResult) -> Callable[[], None] | None:
@@ -685,6 +756,12 @@ class AssistantController(QObject):
         if not result.success:
             self.notify.emit("Needle couldn't finish", result.message)
         try:
+            from . import memory as _memory
+
+            _memory.record_history(getattr(call, "user_text", "") or "", call.name or "")
+        except Exception:
+            pass
+        try:
             audit_record(call.name or "", getattr(call, "arguments", {}), result.success, result.message)
         except Exception:
             pass
@@ -778,6 +855,7 @@ class AssistantController(QObject):
                 self.audio.stop()
             except Exception:
                 pass
+            self.scheduler.stop()
             self.overlay.enabled = False
             self.overlay.hide_immediately()
             self._stop_telegram("Disabled with Needle")
@@ -1110,6 +1188,10 @@ class AssistantController(QObject):
         log.info("Shutting down Needle Desktop.")
         try:
             self._stop_telegram("Off")
+        except Exception:
+            pass
+        try:
+            self.scheduler.stop()
         except Exception:
             pass
         try:

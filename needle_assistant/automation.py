@@ -472,6 +472,28 @@ class DesktopAutomation:
                         str(call.arguments.get("url", "")),
                         str(call.arguments.get("browser", "")),
                     )
+                if call.name == "memory":
+                    return self._memory(
+                        str(call.arguments.get("action", "")),
+                        str(call.arguments.get("alias", "")),
+                        str(call.arguments.get("target", "")),
+                        str(call.arguments.get("key", "")),
+                        str(call.arguments.get("value", "")),
+                    )
+                if call.name == "schedule":
+                    return self._schedule(
+                        str(call.arguments.get("action", "")),
+                        float(call.arguments.get("minutes", 5) or 5),
+                        str(call.arguments.get("message", "")),
+                        call.arguments.get("id"),
+                        bool(call.arguments.get("recurring", False)),
+                    )
+                if call.name == "macro":
+                    return self._macro(
+                        str(call.arguments.get("action", "")),
+                        str(call.arguments.get("name", "")),
+                        str(call.arguments.get("steps", "")),
+                    )
                 if call.name == "type_text":
                     target_hwnd = self._resolve_target_window(
                         call.arguments.get("window"), restore_hwnd
@@ -504,6 +526,7 @@ class DesktopAutomation:
                 return ExecutionResult(False, f"The action failed: {exc}", call.name or "", detail=repr(exc))
 
     def _open_application(self, app_name: str) -> ExecutionResult:
+        app_name = self._resolve_alias(app_name)
         resolved = self._resolver.resolve(app_name)
         before = win.visible_window_handles()
         hwnd = 0
@@ -972,7 +995,16 @@ class DesktopAutomation:
 
     # ------------------------------------------------------------------ windows & power
     @staticmethod
-    def _windows_by_title(title: str) -> list[win.WindowInfo]:
+    def _resolve_alias(name: str) -> str:
+        try:
+            from .memory import get_alias
+
+            alias = get_alias(name)
+            if alias:
+                return alias
+        except Exception:
+            pass
+        return name
         wanted = re.sub(r"\s+", " ", str(title or "").strip().lower())
         if not wanted:
             return []
@@ -1014,6 +1046,7 @@ class DesktopAutomation:
         return matches[0].hwnd
 
     def _close_application(self, app_name: str, force: bool = False) -> ExecutionResult:
+        app_name = self._resolve_alias(app_name)
         resolved = self._resolver.resolve(app_name)
         if resolved.kind != "exe":
             raise AutomationError(
@@ -1089,6 +1122,7 @@ class DesktopAutomation:
                                detail=f"pids={sorted(pids)}")
 
     def _focus_window(self, title: str) -> ExecutionResult:
+        title = self._resolve_alias(title)
         matches = self._windows_by_title(title)
         if not matches:
             raise AutomationError(f"I couldn't find a window titled \"{title}\".")
@@ -1101,6 +1135,7 @@ class DesktopAutomation:
         return ExecutionResult(True, f"Switched to {info.title}.", "focus_window")
 
     def _window_manage(self, title: str, action: str) -> ExecutionResult:
+        title = self._resolve_alias(title)
         normalized = normalize_window_action(action)
         if not normalized:
             raise AutomationError("Use minimize, maximize, or restore.")
@@ -1475,6 +1510,116 @@ class DesktopAutomation:
         if len(text) > 4000:
             text = text[:3997] + "..."
         return ExecutionResult(True, f"Page text:\n{text}", "browser_control")
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._resolver = AppResolver()
+        self._gui_ready = False
+        self._scheduler = None
+        self._last_plan_steps: list[str] = []
+
+    def set_scheduler(self, scheduler) -> None:
+        self._scheduler = scheduler
+
+    def set_last_plan_steps(self, steps: list[str]) -> None:
+        self._last_plan_steps = list(steps or [])
+
+    def _memory(self, action: str, alias: str = "", target: str = "",
+                key: str = "", value: str = "") -> ExecutionResult:
+        from . import memory
+
+        action = (action or "").strip().lower()
+        if action == "set_alias":
+            if not alias or not target:
+                raise AutomationError("Both an alias and a target app are required.")
+            memory.set_alias(alias, target)
+            return ExecutionResult(True, f"Remembered '{alias}' -> {target}.", "memory")
+        if action == "delete_alias":
+            if not alias:
+                raise AutomationError("Which alias should I forget?")
+            if memory.delete_alias(alias):
+                return ExecutionResult(True, f"Forgot the alias '{alias}'.", "memory")
+            return ExecutionResult(False, f"No alias named '{alias}'.", "memory")
+        if action == "list_aliases":
+            aliases = memory.list_aliases()
+            if not aliases:
+                return ExecutionResult(True, "No aliases are stored.", "memory")
+            lines = [f"{k} -> {v}" for k, v in sorted(aliases.items())]
+            return ExecutionResult(True, "Aliases:\n" + "\n".join(lines), "memory")
+        if action == "set_preference":
+            if not key:
+                raise AutomationError("A preference key is required.")
+            memory.record_preference(key, value)
+            return ExecutionResult(True, f"Saved preference {key}.", "memory")
+        raise AutomationError("Unsupported memory action.")
+
+    def _schedule(self, action: str, minutes: float = 5.0, message: str = "",
+                  task_id: int | None = None, recurring: bool = False) -> ExecutionResult:
+        scheduler = self._scheduler
+        if scheduler is None:
+            raise AutomationError("The scheduler is not running.")
+        action = (action or "").strip().lower()
+        if action == "list":
+            tasks = scheduler.list_tasks()
+            if not tasks:
+                return ExecutionResult(True, "No reminders are scheduled.", "schedule")
+            lines = []
+            for task in tasks:
+                due = time.strftime("%H:%M", time.localtime(float(task.get("due", 0))))
+                lines.append(f"#{task.get('id')} at {due}: {task.get('message')}")
+            return ExecutionResult(True, "Scheduled tasks:\n" + "\n".join(lines), "schedule")
+        if action == "cancel":
+            if task_id is None:
+                raise AutomationError("Which reminder ID should I cancel?")
+            if scheduler.cancel(int(task_id)):
+                return ExecutionResult(True, f"Cancelled reminder #{task_id}.", "schedule")
+            return ExecutionResult(False, f"No reminder #{task_id}.", "schedule")
+        if action == "add":
+            task = scheduler.add_recurring(minutes, message or "Reminder", None) if recurring else scheduler.add_reminder(minutes, message or "Reminder", None)
+            return ExecutionResult(
+                True,
+                f"Reminder set for {minutes:g} minute(s): {message or 'Reminder'} (id #{task['id']}).",
+                "schedule",
+            )
+        raise AutomationError("Unsupported schedule action.")
+
+    def _macro(self, action: str, name: str = "", steps: str = "") -> ExecutionResult:
+        from . import macros
+
+        action = (action or "").strip().lower()
+        if action == "list":
+            names = macros.list_names()
+            if not names:
+                return ExecutionResult(True, "No macros are saved.", "macro")
+            return ExecutionResult(True, "Macros: " + ", ".join(names), "macro")
+        if action == "delete":
+            if not name:
+                raise AutomationError("Which macro should I delete?")
+            if macros.delete(name):
+                return ExecutionResult(True, f"Deleted macro '{name}'.", "macro")
+            return ExecutionResult(False, f"No macro named '{name}'.", "macro")
+        if action == "run":
+            if not name:
+                raise AutomationError("Which macro should I run?")
+            steps_list = macros.get(name)
+            if steps_list is None:
+                return ExecutionResult(False, f"No macro named '{name}'.", "macro")
+            # Store for the controller to execute as a plan.
+            self.set_last_plan_steps(steps_list)
+            return ExecutionResult(
+                True,
+                f"Macro '{name}' has {len(steps_list)} step(s). Run it via 'run plan' or say 'run macro {name}'.",
+                "macro",
+            )
+        if action == "save":
+            if not name:
+                raise AutomationError("A macro name is required.")
+            steps_list = self._last_plan_steps
+            if not steps_list:
+                raise AutomationError("There is no recent plan to save as a macro.")
+            macros.set_macro(name, steps_list)
+            return ExecutionResult(True, f"Saved macro '{name}' with {len(steps_list)} step(s).", "macro")
+        raise AutomationError("Unsupported macro action.")
 
     def _control_media(self, action: str) -> ExecutionResult:
         self._prepare_gui()
