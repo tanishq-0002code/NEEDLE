@@ -11,6 +11,45 @@ def _path() -> Path:
     return app_data_dir() / "shortcuts.json"
 
 
+# Built-in shortcuts shipped with Needle Desktop. These work without the user
+# creating anything. User-created shortcuts (stored in shortcuts.json) are
+# checked first, so the user can override any of these.
+_DEFAULT_SHORTCUTS: dict[str, list[str]] = {
+    "i am gonna study": [
+        "open edge",
+        "go to pw.live/study-v2/study",
+    ],
+    "i am going to study": [
+        "open edge",
+        "go to pw.live/study-v2/study",
+    ],
+    "time to study": [
+        "open edge",
+        "go to pw.live/study-v2/study",
+    ],
+    "study time": [
+        "open edge",
+        "go to pw.live/study-v2/study",
+    ],
+    "let's study": [
+        "open edge",
+        "go to pw.live/study-v2/study",
+    ],
+    "lets study": [
+        "open edge",
+        "go to pw.live/study-v2/study",
+    ],
+    "i am gonna study now": [
+        "open edge",
+        "go to pw.live/study-v2/study",
+    ],
+    "study mode": [
+        "open edge",
+        "go to pw.live/study-v2/study",
+    ],
+}
+
+
 def load() -> dict[str, list[str]]:
     try:
         data = json.loads(_path().read_text(encoding="utf-8"))
@@ -40,11 +79,11 @@ def match(text: str) -> tuple[str, list[str]] | None:
     if not cleaned:
         return None
     shortcuts = load()
-    if not shortcuts:
+    # Built-in defaults act as fallback.
+    combined = {**_DEFAULT_SHORTCUTS, **shortcuts}
+    if not combined:
         return None
-    best_score = 0.0
-    best: tuple[str, list[str]] | None = None
-    for trigger, steps in shortcuts.items():
+    for trigger, steps in combined.items():
         trigger_clean = " ".join(str(trigger or "").split()).lower()
         if not trigger_clean or not steps:
             continue
