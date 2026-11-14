@@ -611,7 +611,10 @@ class AssistantController(QObject):
             message = call.error or call.reasoning or "I couldn't map that to a desktop action."
             return call, ExecutionResult(False, message, call.name or "")
 
-        log.info("Telegram command: %r -> %s", text, call.name)
+        if self.config.log_transcripts:
+            log.info("Telegram command: %r -> %s", text, call.name)
+        else:
+            log.info("Telegram command routed to %s", call.name)
         try:
             # Interactive actions target the window that was in front when the
             # remote command arrived, matching the local command flow.
