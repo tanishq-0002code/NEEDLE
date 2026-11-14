@@ -112,7 +112,12 @@ def verify(exe: Path) -> None:
             print(f"Selftest report: {report_path}")
             print(f"Selftest success: {report.get('success')}")
             for item in report.get("checks", []):
-                detail = str(item.get("detail") or "").encode("utf-8", "replace").decode("utf-8")
+                detail = str(item.get("detail") or "")
+                encoding = getattr(__import__("sys").stdout, "encoding", None) or "utf-8"
+                try:
+                    detail = detail.encode(encoding, "replace").decode(encoding)
+                except (LookupError, UnicodeError):
+                    detail = detail.encode("utf-8", "replace").decode("utf-8")
                 print(f"  [{'ok' if item.get('ok') else 'fail'}] {item.get('name')}: {detail}")
         except Exception as exc:
             print(f"Could not read selftest report: {exc}")
