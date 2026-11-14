@@ -17,10 +17,12 @@ from .catalog import destructive_description, fast_route, is_destructive
 from .confirmation import ConfirmationStore
 from .config import AppConfig, load_config, save_config
 from .hotkey import HotkeyManager, OutsideClickWatcher
+from .journal import UndoJournal
 from .models import ExecutionResult, ToolCall
 from .needler import NeedleRouter
 from .overlay import OverlayWindow
 from .paths import app_data_dir, sound_path
+from .planner import is_transient_failure, looks_like_plan, split_plan
 from .settings_dialog import SettingsDialog
 from .telegram_bot import TelegramBot
 from . import windows_api
@@ -34,6 +36,9 @@ class AssistantController(QObject):
     route_ready = pyqtSignal(object, int)
     route_failed = pyqtSignal(str, int)
     execution_ready = pyqtSignal(object, object, int)
+    plan_progress = pyqtSignal(str, int, int)
+    plan_step_done = pyqtSignal(object, object, int, int)
+    plan_done = pyqtSignal(bool, str, int)
     notify = pyqtSignal(str, str)
     status_changed = pyqtSignal(str)
     config_changed = pyqtSignal(object)
@@ -62,6 +67,7 @@ class AssistantController(QObject):
         self.hotkey = HotkeyManager()
         self.outside = OutsideClickWatcher()
         self.automation = DesktopAutomation()
+        self.undo = UndoJournal()
         self.telegram: TelegramBot | None = None
         self.settings: SettingsDialog | None = None
         self._session = 0
@@ -96,6 +102,9 @@ class AssistantController(QObject):
         self.route_ready.connect(self.on_route_ready)
         self.route_failed.connect(self.on_route_failed)
         self.execution_ready.connect(self.on_execution_ready)
+        self.plan_progress.connect(self.on_plan_progress)
+        self.plan_step_done.connect(self.on_plan_step_done)
+        self.plan_done.connect(self.on_plan_done)
         self.refresh_status.connect(self._refresh_settings_status)
         self.confirm_needed.connect(self._on_confirm_needed)
 
@@ -215,6 +224,11 @@ class AssistantController(QObject):
             return
         if self._take_clarification(text):
             return
+        if self._handle_undo(text):
+            return
+        if looks_like_plan(text):
+            self._start_plan(text)
+            return
         self._active = True
         self._session += 1
         session = self._session
@@ -296,7 +310,32 @@ class AssistantController(QObject):
                 return candidate
         return None
 
-    def _take_clarification(self, text: str) -> bool:
+    def _handle_undo(self, text: str) -> bool:
+        cleaned = " ".join(str(text or "").split()).lower()
+        if not cleaned:
+            return False
+        if cleaned in {"undo", "undo that", "undo last", "undo last action"}:
+            count = self.undo.undo_last()
+            if count:
+                self.overlay.show_result(
+                    ExecutionResult(True, "Undone the last action.", "undo"), None, "needle"
+                )
+                self.overlay.hide_after(1400)
+                self._play_sound("done.wav")
+            else:
+                self.overlay.show_error("There is nothing to undo.")
+                self.overlay.hide_after(2200)
+                self._play_sound("error.wav")
+            return True
+        if cleaned in {"undo all", "undo everything", "undo all actions"}:
+            count = self.undo.undo_all()
+            self.overlay.show_result(
+                ExecutionResult(True, f"Undone {count} action(s).", "undo"), None, "needle"
+            )
+            self.overlay.hide_after(1600)
+            self._play_sound("done.wav")
+            return True
+        return False
         pending = self._pending_clarification
         if not pending:
             return False
@@ -333,6 +372,19 @@ class AssistantController(QObject):
 
     def on_route_ready(self, call: ToolCall, session: int) -> None:
         if session != self._session or not self.overlay.isVisible():
+            return
+        if call.name == "run_plan":
+            steps = call.arguments.get("steps", [])
+            if not isinstance(steps, list) or len(steps) < 2:
+                self.overlay.show_error("The plan didn't contain usable steps.")
+                self.overlay.hide_after(2600)
+                self._play_sound("error.wav")
+                return
+            self.overlay.set_thinking(f"Planning {len(steps)} steps…")
+            thread = threading.Thread(
+                target=self._plan_worker, args=(steps, session), name="NeedlePlan", daemon=True
+            )
+            thread.start()
             return
         if not call.name:
             message = call.error or call.reasoning or "I couldn't map that to a desktop action."
@@ -395,6 +447,177 @@ class AssistantController(QObject):
             call.name, time.monotonic() - started, result.success,
         )
         self.execution_ready.emit(result, call, session)
+
+    # ------------------------------------------------------------------ planning
+    def _start_plan(self, text: str) -> None:
+        steps = split_plan(text)
+        if not steps or len(steps) < 2:
+            self._active = True
+            self._session += 1
+            session = self._session
+            self.overlay.set_thinking(text)
+            thread = threading.Thread(
+                target=self._route_worker, args=(text, session), name="NeedleRoute", daemon=True
+            )
+            thread.start()
+            return
+        self._active = True
+        self._session += 1
+        session = self._session
+        self.overlay.set_thinking(f"Planning {len(steps)} steps…")
+        thread = threading.Thread(
+            target=self._plan_worker, args=(steps, session), name="NeedlePlan", daemon=True
+        )
+        thread.start()
+
+    def _plan_worker(self, steps: list[str], session: int) -> None:
+        total = len(steps)
+        overall_success = True
+        final_message = f"Completed {total} step(s)."
+        for index, step_text in enumerate(steps, 1):
+            if session != self._session:
+                return
+            self.plan_progress.emit(f"Step {index}/{total}: {step_text}", index, total)
+            try:
+                call = self.router.route(step_text, use_fast=self.config.fast_intent)
+            except Exception as exc:
+                final_message = f"Step {index} failed: {exc}"
+                overall_success = False
+                break
+            if call.name and not call.user_text:
+                call.user_text = step_text
+            if not call.name:
+                message = call.error or call.reasoning or "I couldn't map that to an action."
+                final_message = f"Step {index} failed: {message}"
+                overall_success = False
+                break
+            if call.name == "run_plan":
+                final_message = f"Step {index} failed: nested plans are not allowed."
+                overall_success = False
+                break
+            # App-name ambiguity / confidence handling is skipped for plan steps
+            # to keep the flow moving; the resolver still raises on no match.
+            interactive = call.name in INTERACTIVE_TOOLS
+            restore = self._foreground_hwnd if interactive else 0
+            if interactive:
+                time.sleep(0.08)
+            # Confirmation gate for destructive steps.
+            if is_destructive(call) and self.config.confirm_destructive:
+                if not self._confirm_local(destructive_description(call)):
+                    final_message = f"Step {index} cancelled."
+                    overall_success = False
+                    break
+            if call.name == "system_control" and not self.config.allow_power_actions:
+                final_message = f"Step {index} failed: power actions are disabled."
+                overall_success = False
+                break
+            result = self.automation.execute(call, restore_hwnd=restore)
+            # One retry for transient failures.
+            if (not result.success) and is_transient_failure(result.message):
+                time.sleep(0.8)
+                result = self.automation.execute(call, restore_hwnd=restore)
+            try:
+                audit_record(call.name or "", getattr(call, "arguments", {}), result.success, result.message)
+            except Exception:
+                pass
+            # Record undo inverse when possible.
+            inverse = self._inverse_for(call, result)
+            if inverse is not None:
+                self.undo.record(inverse)
+            self.plan_step_done.emit(call, result, index, total)
+            if not result.success:
+                final_message = f"Step {index} failed: {result.message}"
+                overall_success = False
+                break
+        self.plan_done.emit(overall_success, final_message, session)
+
+    def _inverse_for(self, call: ToolCall, result: ExecutionResult) -> Callable[[], None] | None:
+        import functools
+
+        if call.name == "window_manage":
+            action = str(call.arguments.get("action", ""))
+            title = str(call.arguments.get("title", ""))
+            if action == "minimize":
+                return lambda: self.automation.execute(
+                    ToolCall(name="window_manage", arguments={"title": title, "action": "restore"})
+                )
+            if action == "maximize":
+                return lambda: self.automation.execute(
+                    ToolCall(name="window_manage", arguments={"title": title, "action": "restore"})
+                )
+            return None
+        if call.name == "focus_window":
+            previous = self._last_external_hwnd
+            if previous:
+                return lambda: windows_api.focus_window(previous)
+            return None
+        if call.name == "open_application":
+            app_name = str(call.arguments.get("app_name", ""))
+            if app_name:
+                return lambda: self.automation.execute(
+                    ToolCall(name="close_application", arguments={"app_name": app_name})
+                )
+            return None
+        if call.name == "close_application":
+            app_name = str(call.arguments.get("app_name", ""))
+            if app_name:
+                return lambda: self.automation.execute(
+                    ToolCall(name="open_application", arguments={"app_name": app_name})
+                )
+            return None
+        if call.name == "file_operation":
+            op = str(call.arguments.get("op", ""))
+            path = str(call.arguments.get("path", ""))
+            new_path = str(call.arguments.get("new_path", ""))
+            if op == "rename" and new_path:
+                return lambda: self.automation.execute(
+                    ToolCall(name="file_operation", arguments={"op": "rename", "path": new_path, "new_path": path})
+                )
+            if op == "move" and new_path:
+                return lambda: self.automation.execute(
+                    ToolCall(name="file_operation", arguments={"op": "move", "path": new_path, "new_path": path})
+                )
+            if op == "create":
+                return lambda: self.automation.execute(
+                    ToolCall(name="file_operation", arguments={"op": "delete", "path": path})
+                )
+            return None
+        if call.name == "clipboard" and str(call.arguments.get("action", "")) == "set":
+            previous = getattr(self, "_clipboard_before", "")
+            text = str(call.arguments.get("text", ""))
+            self._clipboard_before = text
+            return lambda: self.automation.execute(
+                ToolCall(name="clipboard", arguments={"action": "set", "text": previous})
+            )
+        return None
+
+    def on_plan_progress(self, text: str, index: int, total: int) -> None:
+        if not self.overlay.isVisible():
+            return
+        self.overlay.set_thinking(text)
+
+    def on_plan_step_done(self, call: ToolCall, result: ExecutionResult, index: int, total: int) -> None:
+        if not self.overlay.isVisible():
+            return
+        self.overlay.show_result(result, call, call.source)
+
+    def on_plan_done(self, success: bool, message: str, session: int) -> None:
+        if session != self._session:
+            return
+        if success:
+            self.overlay.show_result(
+                ExecutionResult(True, message, "run_plan"), None, "needle"
+            )
+            self._play_sound("done.wav")
+        else:
+            self.overlay.show_error(message)
+            self._play_sound("error.wav")
+        self.overlay.hide_after(1200 if success else 3200)
+        self._active = False
+        try:
+            self.undo.clear() if not success else None
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ confirmation
     def _confirm_local(self, description: str) -> bool:
@@ -697,6 +920,11 @@ class AssistantController(QObject):
             handler=self._execute_telegram_command,
             status_provider=self._telegram_status_text,
             on_pair=self._on_telegram_paired,
+            classify=self._classify_for_telegram,
+            confirmation_required=self._confirmation_required_for_telegram,
+            executor=self._execute_telegram_command,
+            confirmation_store=self._confirmation_store,
+            undo_handler=self._telegram_undo,
         )
         self.telegram = bot
         self._telegram_token = token
@@ -775,6 +1003,12 @@ class AssistantController(QObject):
         if not self.config.confirm_destructive:
             return False
         return is_destructive(call)
+
+    def _telegram_undo(self) -> tuple[int, str]:
+        count = self.undo.undo_last()
+        if count:
+            return count, "Undone the last action."
+        return 0, "There is nothing to undo."
 
     def _execute_telegram_command(self, text: str) -> tuple[ToolCall, ExecutionResult]:
         text = " ".join((text or "").split())

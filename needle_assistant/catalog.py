@@ -188,6 +188,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "run_plan",
+        "description": "Run several desktop commands in order",
+        "triggers": [r"^(?:please\s+)?(?:run|do)\s+(?:these|the following|a plan|steps)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {"type": "string"},
+            },
+            "required": ["steps"],
+        },
+    },
+    {
         "name": "run_command",
         "description": "Run a shell command and return its output",
         "triggers": [r"^(?:please\s+)?(?:run|execute|shell)\b"],
@@ -691,6 +703,23 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         if op in {"rename", "move"} and not new_path:
             raise ValueError("A destination path is required.")
         return name, result
+    if name == "run_plan":
+        raw = str(arguments.get("steps", "")).strip()
+        if not raw:
+            raise ValueError("A step list is required.")
+        try:
+            import json as _json
+
+            parsed = _json.loads(raw)
+        except Exception:
+            # Allow newline-separated steps as a fallback.
+            parsed = [line.strip() for line in raw.splitlines() if line.strip()]
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError("Steps must be a list of commands.")
+        steps = [str(item).strip() for item in parsed if str(item).strip()]
+        if not steps or len(steps) > 10:
+            raise ValueError("A plan needs between 1 and 10 steps.")
+        return name, {"steps": steps}
     if name == "run_command":
         command = str(arguments.get("command", "")).strip()
         if not command:
@@ -935,6 +964,8 @@ def is_destructive(call: ToolCall) -> bool:
         return str(call.arguments.get("op", "")).lower() in {"delete", "rename", "move"}
     if call.name == "run_command":
         return True
+    if call.name == "run_plan":
+        return True
     return False
 
 
@@ -959,6 +990,10 @@ def destructive_description(call: ToolCall) -> str:
         return f"{op} {path}"
     if call.name == "run_command":
         return f"run shell command: {str(call.arguments.get('command', ''))[:80]}"
+    if call.name == "run_plan":
+        steps = call.arguments.get("steps", [])
+        n = len(steps) if isinstance(steps, list) else 0
+        return f"run a {n}-step plan"
     return "run this action"
 
 
@@ -998,6 +1033,9 @@ def badge_text(call: ToolCall) -> str:
         detail = str(call.arguments.get("action", ""))
         if call.arguments.get("url"):
             detail = f"{detail} {call.arguments['url']}"
+    elif call.name == "run_plan":
+        steps = call.arguments.get("steps", [])
+        detail = f"{len(steps) if isinstance(steps, list) else '?'} steps"
     if call.name in {"type_text", "click_element"} and call.arguments.get("window"):
         detail = f"{detail} → {call.arguments['window']}"
     detail = _compact(detail)
@@ -1058,6 +1096,10 @@ def describe_call(call: ToolCall) -> str:
         if url:
             return f"Browser: {action} {url}"
         return f"Browser: {action}"
+    if call.name == "run_plan":
+        steps = call.arguments.get("steps", [])
+        n = len(steps) if isinstance(steps, list) else 0
+        return f"Running a {n}-step plan"
     if call.name in {"type_text", "click_element"} and call.arguments.get("window"):
         target = call.arguments.get("text") if call.name == "type_text" else call.arguments.get("target")
         return f"{'Typing' if call.name == 'type_text' else 'Clicking'} {target} in {call.arguments['window']}"
