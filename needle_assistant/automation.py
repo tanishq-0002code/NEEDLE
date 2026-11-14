@@ -1014,13 +1014,6 @@ class DesktopAutomation:
         return name
 
     @staticmethod
-    def _windows_by_title(title: str) -> list[win.WindowInfo]:
-        wanted = re.sub(r"\s+", " ", str(title or "").strip().lower())
-        if not wanted:
-            return []
-        return [info for info in win.enumerate_windows() if wanted in info.title.lower()]
-
-    @staticmethod
     def _pids_for_exe(exe_name: str) -> set[int]:
         wanted = str(exe_name or "").strip().lower()
         pids: set[int] = set()
@@ -1385,6 +1378,45 @@ class DesktopAutomation:
 
     _BROWSER_PROCESSES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe"}
 
+    def _windows_by_title(self, title: str) -> list[win.WindowInfo]:
+        """Match windows for an app/window description.
+
+        Prefers matching by executable when the name resolves to a known app,
+        falling back to a case-insensitive title substring.
+        """
+        wanted = re.sub(r"\s+", " ", str(title or "").strip()).lower()
+        if not wanted:
+            return []
+
+        # 1. Try to resolve as an app and match its windows by process.
+        try:
+            resolved = self._resolver.resolve(wanted)
+        except Exception:
+            resolved = None
+        exe_names: list[str] = []
+        if resolved is not None:
+            if resolved.kind == "exe":
+                exe_names.append(Path(resolved.target).name.lower())
+            else:
+                stem = Path(resolved.target).stem.lower()
+                if stem:
+                    exe_names.append(stem if stem.endswith(".exe") else stem + ".exe")
+        # Also best-effort known mapping for common short names.
+        short = {"edge": "msedge.exe", "chrome": "chrome.exe",
+                 "firefox": "firefox.exe", "brave": "brave.exe", "opera": "opera.exe"}
+        if wanted in short:
+            exe_names.insert(0, short[wanted])
+
+        for exe_name in dict.fromkeys(exe_names):
+            pids = self._pids_for_exe(exe_name)
+            if pids:
+                matches = [info for info in win.enumerate_windows() if info.pid in pids]
+                if matches:
+                    return matches
+
+        # 2. Title-substring fallback.
+        return [info for info in win.enumerate_windows() if wanted in info.title.lower()]
+
     def _find_browser_window(self, browser: str | None) -> int:
         wanted_proc = None
         if browser:
@@ -1464,6 +1496,60 @@ class DesktopAutomation:
                 controller.press(Key.tab)
                 controller.release(Key.tab)
             return ExecutionResult(True, "Switched to the previous tab.", "browser_control")
+        if action == "click_first_result":
+            hwnd = self._find_browser_window(browser or None)
+            if not hwnd:
+                raise AutomationError("No browser window was found. Open a browser first.")
+            win.focus_window(hwnd)
+            time.sleep(0.25)
+            try:
+                import comtypes
+                import uiautomation as auto
+
+                comtypes.CoInitialize()
+                try:
+                    root = auto.ControlFromHandle(hwnd)
+                    if root is None:
+                        root = auto.GetRootControl()
+                    links: list = []
+                    skip_substrings = (
+                        "google", "more", "settings", "help", "sign in",
+                        "images", "videos", "maps", "news", "shopping",
+                    )
+
+                    def _walk(node, depth):
+                        try:
+                            children = node.GetChildren()
+                        except Exception:
+                            children = []
+                        for child in children:
+                            try:
+                                ctype = (child.ControlTypeName or "").lower()
+                                name = (child.Name or "").strip()
+                                if "hyperlink" in ctype:
+                                    lower = name.lower()
+                                    if name and not any(s in lower for s in skip_substrings):
+                                        links.append(child)
+                            except Exception:
+                                pass
+                            if depth < 6:
+                                _walk(child, depth + 1)
+
+                    _walk(root, 0)
+                finally:
+                    comtypes.CoUninitialize()
+            except Exception as exc:
+                raise AutomationError(f"Could not read page links: {exc}") from exc
+            if not links:
+                raise AutomationError("No hyperlink was found on the page. The page may not have loaded.")
+            first = links[0]
+            try:
+                point = first.GetClickablePoint()
+                x, y = int(point.x), int(point.y)
+            except Exception:
+                raise AutomationError("Could not select the first link's clickable point.")
+            self._mouse_click(x, y)
+            return ExecutionResult(True, "Clicked the first link on the page.", "browser_control")
         if action == "tab_close":
             target = str(target or "").strip()
             if target:
@@ -1477,10 +1563,25 @@ class DesktopAutomation:
                         hwnd = self._find_browser_window(browser or None)
                         root = auto.ControlFromHandle(hwnd) if hwnd else auto.GetRootControl()
                         if root is not None:
-                            tab = root.Control(searchDepth=8, SubName=target)
+                            tab = root.Control(searchDepth=12, SubName=target)
                             if tab is None or not tab.Exists(0.5):
-                                tab = root.Control(searchDepth=8, Name=target)
-                            if tab is not None and tab.Exists(0.5):
+                                tab = root.Control(searchDepth=12, Name=target)
+                            if (tab is None or not tab.Exists(0.5)):
+                                # Fallback: enumerate tab controls and match by substring.
+                                try:
+                                    candidates = root.GetChildren()
+                                    for cand in candidates:
+                                        try:
+                                            ctype = getattr(cand, "ControlTypeName", "") or ""
+                                            name = (cand.Name or "").lower()
+                                            if "tab" in ctype.lower() and target.lower() in name:
+                                                cand.SetFocus()
+                                                break
+                                        except Exception:
+                                            continue
+                                except Exception:
+                                    pass
+                            elif tab is not None and tab.Exists(0.5):
                                 try:
                                     tab.SetFocus()
                                 except Exception:

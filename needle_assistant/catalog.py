@@ -224,7 +224,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page"],
+                    "enum": ["open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result"],
                 },
                 "url": {"type": "string"},
                 "browser": {"type": "string"},
@@ -814,7 +814,7 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         return name, {"command": command, "timeout": timeout}
     if name == "browser_control":
         action = str(arguments.get("action", "")).strip().lower()
-        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page"}:
+        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result"}:
             action = "open_url" if str(arguments.get("url", "")).strip() else "read_page"
         result = {"action": action}
         url = str(arguments.get("url", "")).strip()
@@ -1136,6 +1136,19 @@ def fast_route(text: str) -> ToolCall | None:
             return None
         return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                         reasoning="Matched focus-window phrase.", user_text=text)
+
+    first_link = re.fullmatch(
+        r"(?:please\s+)?(?:open|click|tap|follow|select)\s+(?:the\s+)?(?:first|top)\s+(?:link|result|page|one)(?:\s+(?:in|on)\s+[^.]+)?",
+        cleaned,
+        re.I,
+    )
+    if first_link:
+        try:
+            name, arguments = validate_call("browser_control", {"action": "click_first_result"})
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched first-link phrase.", user_text=text)
 
     opened = _OPEN_RE.fullmatch(original)
     if opened:
