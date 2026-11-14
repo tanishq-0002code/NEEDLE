@@ -774,24 +774,57 @@ class DesktopAutomation:
             action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
             return ExecutionResult(True, f"{action_desc} the {semantic} of the screen.", "click_element")
 
-        self._click_uia(sub_target, restore_hwnd, button=btn, clicks=clicks_count)
-        action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
-        return ExecutionResult(True, f"{action_desc} {sub_target}.", "click_element")
+        try:
+            self._click_uia(sub_target, restore_hwnd, button=btn, clicks=clicks_count)
+            return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
+        except AutomationError:
+            # Fallback: scan visible text on screen with OCR and click the match.
+            try:
+                from .vision import ocr_words
+                import pyautogui
+                words = ocr_words(self._grab_screen_image())
+                tokens = [t for t in re.findall(r"[a-z0-9]+", sub_target.lower()) if t]
+                if not tokens:
+                    raise AutomationError(f"I couldn't find '{sub_target}' on the screen.")
+                match_words = [w for w in words if any(t in (w.get("text") or "").lower() for t in tokens)]
+                if match_words:
+                    first = match_words[0]
+                    x = int(first["x"] + first.get("width", 0) // 2)
+                    y = int(first["y"] + first.get("height", 0) // 2)
+                    pyautogui.moveTo(x, y, duration=0.12)
+                    pyautogui.click(x, y, clicks=clicks_count, button=btn)
+                    return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
+                raise AutomationError(f"I couldn't find '{sub_target}' on the screen.")
+            except Exception as exc:
+                raise AutomationError(f"I couldn't find '{sub_target}' on the screen.") from exc
 
     @staticmethod
     def _screen_aliases(screen: tuple[int, int]) -> dict[str, tuple[int, int]]:
         w, h = screen
         return {
             "center": (w // 2, h // 2),
+            "centre": (w // 2, h // 2),
             "middle": (w // 2, h // 2),
             "top left": (w // 6, h // 6),
+            "top-left": (w // 6, h // 6),
             "top right": (w * 5 // 6, h // 6),
+            "top-right": (w * 5 // 6, h // 6),
+            "upper-left": (w // 6, h // 6),
+            "upper-right": (w * 5 // 6, h // 6),
             "bottom left": (w // 6, h * 5 // 6),
+            "bottom-left": (w // 6, h * 5 // 6),
             "bottom right": (w * 5 // 6, h * 5 // 6),
+            "bottom-right": (w * 5 // 6, h * 5 // 6),
+            "lower-left": (w // 6, h * 5 // 6),
+            "lower-right": (w * 5 // 6, h * 5 // 6),
             "top center": (w // 2, h // 6),
             "bottom center": (w // 2, h * 5 // 6),
             "left center": (w // 6, h // 2),
             "right center": (w * 5 // 6, h // 2),
+            "left side": (w // 6, h // 2),
+            "right side": (w * 5 // 6, h // 2),
+            "top": (w // 2, h // 6),
+            "bottom": (w // 2, h * 5 // 6),
         }
 
     @staticmethod
