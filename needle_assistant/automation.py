@@ -472,6 +472,7 @@ class DesktopAutomation:
                         str(call.arguments.get("url", "")),
                         str(call.arguments.get("browser", "")),
                         str(call.arguments.get("target", "")),
+                        int(call.arguments.get("amount", 5) or 5),
                     )
                 if call.name == "memory":
                     return self._memory(
@@ -480,6 +481,11 @@ class DesktopAutomation:
                         str(call.arguments.get("target", "")),
                         str(call.arguments.get("key", "")),
                         str(call.arguments.get("value", "")),
+                    )
+                if call.name == "send_message":
+                    return self._send_message(
+                        str(call.arguments.get("recipient", "")),
+                        str(call.arguments.get("text", "")),
                     )
                 if call.name == "schedule":
                     return self._schedule(
@@ -1450,9 +1456,9 @@ class DesktopAutomation:
                 return info.hwnd
         return 0
 
-    def _browser_control(self, action: str, url: str = "", browser: str = "", target: str = "") -> ExecutionResult:
+    def _browser_control(self, action: str, url: str = "", browser: str = "", target: str = "", amount: int = 5) -> ExecutionResult:
         action = (action or "").strip().lower()
-        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result"}:
+        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down"}:
             raise AutomationError("Unsupported browser action.")
         if action == "open_url":
             url = str(url or "").strip()
@@ -1496,6 +1502,29 @@ class DesktopAutomation:
                 controller.press(Key.tab)
                 controller.release(Key.tab)
             return ExecutionResult(True, "Switched to the previous tab.", "browser_control")
+        if action in {"scroll_up", "scroll_down"}:
+            hwnd = self._find_browser_window(browser or None)
+            if not hwnd:
+                raise AutomationError("No browser window was found. Open a browser first.")
+            win.focus_window(hwnd)
+            time.sleep(0.12)
+            amount_raw = max(1, min(100, int(amount)))
+            try:
+                import pyautogui
+
+                rect = win.get_window_rect(hwnd)
+                width = max(1, rect[2] - rect[0])
+                height = max(1, rect[3] - rect[1])
+                center_x = rect[0] + width // 2
+                center_y = rect[1] + height // 2
+                pyautogui.moveTo(center_x, center_y, duration=0.12)
+                clicks = 120 * amount_raw if action == "scroll_up" else -120 * amount_raw
+                pyautogui.scroll(clicks)
+            except Exception as exc:
+                raise AutomationError(f"Could not scroll: {exc}") from exc
+            direction = "up" if action == "scroll_up" else "down"
+            return ExecutionResult(True, f"Scrolled {direction} {amount_raw} units.", "browser_control")
+
         if action == "click_first_result":
             hwnd = self._find_browser_window(browser or None)
             if not hwnd:
@@ -1723,12 +1752,92 @@ class DesktopAutomation:
                 return ExecutionResult(True, "No aliases are stored.", "memory")
             lines = [f"{k} -> {v}" for k, v in sorted(aliases.items())]
             return ExecutionResult(True, "Aliases:\n" + "\n".join(lines), "memory")
+        if action == "set_contact":
+            if not alias or not target:
+                raise AutomationError("Provide a name and a number, e.g. 'remember rahul as +91 98765 43210'.")
+            digits = re.sub(r"\D", "", target)
+            if len(digits) < 7 or len(digits) > 15:
+                raise AutomationError("That does not look like a phone number (7–15 digits).")
+            memory.set_contact(alias, target)
+            return ExecutionResult(True, f"Saved contact '{alias}' -> {target}.", "memory")
+        if action == "delete_contact":
+            if not alias:
+                raise AutomationError("Which contact should I forget?")
+            if memory.delete_contact(alias):
+                return ExecutionResult(True, f"Forgot the contact '{alias}'.", "memory")
+            return ExecutionResult(False, f"No contact named '{alias}'.", "memory")
+        if action == "list_contacts":
+            contacts = memory.list_contacts()
+            if not contacts:
+                return ExecutionResult(True, "No contacts are stored. Add one with 'remember rahul as +91 98765 43210'.", "memory")
+            lines = [f"{k} -> {v}" for k, v in sorted(contacts.items())]
+            return ExecutionResult(True, "Contacts:\n" + "\n".join(lines), "memory")
         if action == "set_preference":
             if not key:
                 raise AutomationError("A preference key is required.")
             memory.record_preference(key, value)
             return ExecutionResult(True, f"Saved preference {key}.", "memory")
         raise AutomationError("Unsupported memory action.")
+
+    def _send_message(self, recipient: str, text: str) -> ExecutionResult:
+        """Open WhatsApp with the message prefilled (wa.me deep link).
+
+        WhatsApp has no offline/local API, so this opens the chat with the
+        text ready; the user presses Enter (or the send button) to deliver it.
+        """
+        import urllib.parse
+
+        from . import memory
+
+        recipient = " ".join((recipient or "").split()).strip()
+        if not recipient:
+            raise AutomationError("Who should I message?")
+        label = re.sub(r"\s+(?:on|in)\s+(?:whatsapp|wa)$", "", recipient, flags=re.I).strip() or recipient
+
+        # A raw phone number is accepted directly; otherwise look up the contacts store.
+        digits = re.sub(r"\D", "", recipient)
+        phone_like = bool(re.fullmatch(r"\s*\+?[0-9][0-9\s().-]{6,}[0-9]\s*", recipient))
+        used_draft = False
+        if phone_like and 7 <= len(digits) <= 15:
+            number = digits
+        else:
+            contact = memory.get_contact(label)
+            if contact is None:
+                known = sorted(memory.list_contacts())
+                hint = f"No contact named '{label}'. Say e.g. 'remember {label} as +91 98765 43210' to add one."
+                if known:
+                    hint += " Known contacts: " + ", ".join(known[:10]) + "."
+                raise AutomationError(hint)
+            number = re.sub(r"\D", "", contact)
+            if len(number) < 7 or len(number) > 15:
+                raise AutomationError(f"The stored number for '{label}' looks wrong: {contact}")
+
+        text = (text or "").strip()
+        if not text:
+            draft = memory.get_preference("draft")
+            if isinstance(draft, str) and draft.strip():
+                text = draft.strip()
+                used_draft = True
+            else:
+                raise AutomationError(
+                    "What should the message say? Include it, e.g. "
+                    "'send a message to " + label + " saying I'll be late', "
+                    "or save a draft with 'remember the message ...'."
+                )
+        if len(text) > 3000:
+            text = text[:3000]
+        url = "https://wa.me/" + number + "?text=" + urllib.parse.quote(text, safe="")
+        try:
+            os.startfile(url)  # type: ignore[attr-defined]
+        except OSError as exc:
+            raise AutomationError(f"Could not open WhatsApp: {exc}") from exc
+        suffix = " (used your saved draft)" if used_draft else ""
+        return ExecutionResult(
+            True,
+            f"Opened WhatsApp for {label} with your message prefilled{suffix} — "
+            "press Enter (or the send button) to deliver it.",
+            "send_message",
+        )
 
     def _schedule(self, action: str, minutes: float = 5.0, message: str = "",
                   task_id: int | None = None, recurring: bool = False) -> ExecutionResult:

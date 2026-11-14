@@ -224,23 +224,24 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result"],
+                    "enum": ["open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down"],
                 },
                 "url": {"type": "string"},
                 "browser": {"type": "string"},
                 "target": {"type": "string"},
+                "amount": {"type": "integer"},
             },
             "required": ["action"],
         },
     },
     {
         "name": "memory",
-        "description": "Remember an app alias or preference",
-        "triggers": [r"\b(?:remember|alias|preference)\b"],
+        "description": "Remember an app alias, a phone contact, or a preference",
+        "triggers": [r"\b(?:remember|alias|preference|contact)\b"],
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["set_alias", "delete_alias", "list_aliases", "set_preference"]},
+                "action": {"type": "string", "enum": ["set_alias", "delete_alias", "list_aliases", "set_preference", "set_contact", "delete_contact", "list_contacts"]},
                 "alias": {"type": "string"},
                 "target": {"type": "string"},
                 "key": {"type": "string"},
@@ -291,6 +292,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "steps": {"type": "string"},
             },
             "required": ["action"],
+        },
+    },
+    {
+        "name": "send_message",
+        "description": "Send a WhatsApp message to a saved contact or phone number. "
+                       "If no text is given, the saved draft is used.",
+        "triggers": [
+            r"\bwhatsapp\b",
+            r"\b(?:send|message|text|tell)\b.*\b(?:message|msg|text)\b",
+        ],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "recipient": {"type": "string"},
+                "text": {"type": "string"},
+            },
+            "required": ["recipient"],
         },
     },
 ]
@@ -637,6 +655,76 @@ def _open_app_from_request(text: str) -> str | None:
     return name or None
 
 
+_WA_TEXT_PATTERNS = [
+    # "send a whatsapp message to rahul saying I'm late" /
+    # "send a message to rahul that says ..." / "send a message to rahul: ..."
+    r"^(?:send|write|compose)\s+(?:an?\s+)?(?:whatsapp\s+)?(?:message|msg|text)\s+to\s+(.+?)\s+(?:saying|that\s+says|with\s+(?:the\s+)?(?:message|text)|:)\s*(.+)$",
+    # "send rahul a whatsapp message saying ..." / "message rahul a whatsapp message: ..."
+    r"^(?:send|message|text|whatsapp)\s+(.+?)\s+(?:an?\s+)?whatsapp\s+(?:message|msg|text)\s+(?:saying|that\s+says|:)\s*(.+)$",
+    # "whatsapp rahul saying ..." / "whatsapp rahul: ..." / "send whatsapp to rahul: ..."
+    r"^(?:send\s+)?whatsapp\s+(?:to\s+)?(.+?)\s*(?::\s*|\s+saying\s+|\s+that\s+says\s+)\s*(.+)$",
+    # "tell rahul on whatsapp I'm late" / "tell rahul on whatsapp that ..."
+    r"^tell\s+(.+?)\s+on\s+whatsapp\s+(?:that\s+|saying\s+)?(.+)$",
+    # "message rahul saying ..." / "message rahul on whatsapp saying ..." / "message rahul: ..."
+    r"^message\s+(.+?)\s+(?:on\s+whatsapp\s+)?(?:saying|that\s+says|:)\s*(.+)$",
+    # "send rahul a message saying ..." / "send rahul message: ..."
+    r"^send\s+(.+?)\s+(?:an?\s+)?(?:whatsapp\s+)?(?:message|msg|text)\s+(?:saying|that\s+says|:)\s*(.+)$",
+    # "text rahul saying ..." / "text rahul ..." with explicit separator
+    r"^(?:text|message)\s+(.+?)\s+saying\s+(.+)$",
+]
+
+_WA_DRAFT_PATTERNS = [
+    # "send this message to rahul (on whatsapp)" / "send the message to rahul" / "send that message to rahul"
+    r"^(?:send|deliver)\s+(?:this|the|that)\s+(?:message|msg|text)\s+to\s+(.+?)(?:\s+on\s+whatsapp)?[.!?]*$",
+    # "send this to rahul (on whatsapp)"
+    r"^(?:send|deliver)\s+this\s+to\s+(.+?)(?:\s+on\s+whatsapp)?[.!?]*$",
+    # "send a (whatsapp) message to rahul" with no explicit text -> saved draft
+    r"^(?:send|write|compose)\s+(?:an?\s+)?(?:whatsapp\s+)?(?:message|msg|text)\s+to\s+(.+?)(?:\s+on\s+whatsapp)?[.!?]*$",
+    # "tell rahul on whatsapp" -> draft
+    r"^tell\s+(.+?)\s+on\s+whatsapp[.!?]*$",
+]
+
+
+def _strip_whatsapp_suffix(value: str) -> str:
+    result = _compact(value).strip(" \"'“”‘’")
+    result = re.sub(r"^(?:to|the)\s+", "", result, flags=re.I)
+    result = re.sub(r"\s+(?:on|in)\s+(?:whatsapp|wa)$", "", result, flags=re.I)
+    return result.strip()
+
+
+def _whatsapp_call(text: str, recipient: str, message: str) -> ToolCall:
+    try:
+        name, arguments = validate_call("send_message", {"recipient": recipient, "text": message}, text)
+    except ValueError as exc:
+        return ToolCall(name=None, user_text=text, source="fast",
+                        error=str(exc), reasoning=str(exc))
+    return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                    reasoning="Matched WhatsApp-message phrase.", user_text=text)
+
+
+def _send_message_from_request(text: str) -> ToolCall | None:
+    original = _strip_polite_keepcase(text)
+    if not original:
+        return None
+    for pattern in _WA_TEXT_PATTERNS:
+        match = re.match(pattern, original, re.I)
+        if not match:
+            continue
+        recipient = _strip_whatsapp_suffix(match.group(1))
+        message = match.group(2).strip().strip("\"'“”‘’")
+        if recipient and message:
+            return _whatsapp_call(text, recipient, message)
+    for pattern in _WA_DRAFT_PATTERNS:
+        match = re.match(pattern, original, re.I)
+        if not match:
+            continue
+        recipient = _strip_whatsapp_suffix(match.group(1))
+        if recipient:
+            # Text resolved at execution time: the saved draft, or a clear error.
+            return _whatsapp_call(text, recipient, "")
+    return None
+
+
 def validate_call(name: str, arguments: dict[str, Any] | None,
                   user_text: str = "") -> tuple[str, dict[str, Any]]:
     if isinstance(arguments, str):
@@ -814,7 +902,7 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         return name, {"command": command, "timeout": timeout}
     if name == "browser_control":
         action = str(arguments.get("action", "")).strip().lower()
-        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result"}:
+        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down"}:
             action = "open_url" if str(arguments.get("url", "")).strip() else "read_page"
         result = {"action": action}
         url = str(arguments.get("url", "")).strip()
@@ -826,12 +914,19 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         target = str(arguments.get("target", "")).strip()
         if target:
             result["target"] = target
+        amount = arguments.get("amount")
+        if amount is not None:
+            try:
+                result["amount"] = int(amount)
+            except Exception:
+                result["amount"] = 5
         if action == "open_url" and not url:
             raise ValueError("A URL is required.")
         return name, result
     if name == "memory":
         action = str(arguments.get("action", "")).strip().lower()
-        if action not in {"set_alias", "delete_alias", "list_aliases", "set_preference"}:
+        if action not in {"set_alias", "delete_alias", "list_aliases", "set_preference",
+                          "set_contact", "delete_contact", "list_contacts"}:
             action = "list_aliases"
         result = {"action": action}
         if arguments.get("alias"):
@@ -842,6 +937,13 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
             result["key"] = str(arguments.get("key")).strip()[:80]
         if arguments.get("value") is not None:
             result["value"] = str(arguments.get("value"))[:500]
+        if action == "set_contact":
+            if not result.get("alias") or not result.get("target"):
+                raise ValueError("Provide a name and a number, e.g. 'remember rahul as +91 98765 43210'.")
+            if not re.search(r"\d{7,}", re.sub(r"\D", "", result["target"])):
+                raise ValueError("That does not look like a phone number.")
+        if action == "delete_contact" and not result.get("alias"):
+            raise ValueError("Which contact should I forget?")
         return name, result
     if name == "schedule":
         action = str(arguments.get("action", "")).strip().lower()
@@ -905,6 +1007,20 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         if action == "delete" and "trigger" not in result:
             raise ValueError("Which shortcut should I delete?")
         return name, result
+    if name == "send_message":
+        recipient = _compact(str(arguments.get("recipient", ""))).strip(" \"'")
+        recipient = re.sub(r"^(?:to|the)\s+", "", recipient, flags=re.I)
+        recipient = re.sub(r"\s+(?:on|in)\s+(?:whatsapp|wa)$", "", recipient, flags=re.I).strip()
+        if not recipient:
+            raise ValueError("Who should I message? For example: 'send a message to rahul saying I'm late'.")
+        if recipient.lower() in {"someone", "somebody", "anyone", "a contact", "friend", "them", "him", "her"}:
+            raise ValueError("Tell me who to message by name, e.g. 'send this message to rahul on whatsapp'.")
+        if len(recipient) > 80 or re.search(r"[\x00-\x1f]", recipient):
+            raise ValueError("The recipient is invalid.")
+        text = str(arguments.get("text", "")).strip()
+        if "\x00" in text:
+            raise ValueError("The message text contains an invalid character.")
+        return name, {"recipient": recipient, "text": text[:3000]}
     if name == "press_hotkey":
         raw_keys = arguments.get("keys", [])
         try:
@@ -1031,32 +1147,37 @@ def fast_route(text: str) -> ToolCall | None:
             return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                             reasoning="Matched search phrase.", user_text=text)
 
-    # "send a whatsapp message to X" -> open WhatsApp Web in Microsoft Edge
-    if re.fullmatch(
-        r"(?:please\s+)?(?:send|write|compose|type)\s+(?:a\s+|an\s+)?(?:whatsapp\s+)?(?:message|msg|text)(?:\s+to\s+[^.!?]+)?",
-        cleaned,
-        re.I,
-    ) or re.fullmatch(
-        r"(?:please\s+)?(?:send\s+)?(?:a\s+)?whatsapp(?:\s+(?:message|msg|text))?(?:\s+to\s+[^.!?]+)?",
-        cleaned,
-        re.I,
-    ) or re.search(
-        r"\bwhatsapp\b.*(?:message|msg|text)",
-        cleaned,
-        re.I,
-    ) or re.search(
-        r"(?:message|msg|text).*\bwhatsapp\b",
-        cleaned,
-        re.I,
-    ):
+    # Browser scrolling.
+    if re.search(r"\b(?:scroll|page)\s+(up|down)\b", cleaned, re.I):
+        direction = re.search(r"\b(?:scroll|page)\s+(up|down)\b", cleaned, re.I).group(1).lower()
+        action = "scroll_up" if direction == "up" else "scroll_down"
         try:
-            name, arguments = validate_call(
-                "browser_control", {"action": "open_url", "url": "https://web.whatsapp.com/", "browser": "edge"}
-            )
+            name, arguments = validate_call("browser_control", {"action": action, "amount": 5})
         except ValueError:
             return None
         return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
-                        reasoning="Matched WhatsApp-message phrase.", user_text=text)
+                        reasoning="Matched browser-scroll phrase.", user_text=text)
+
+    # "play X" / "play the video of X" -> click element named X.
+    play_match = re.fullmatch(
+        r"(?:please\s+)?play\s+(?:the\s+)?(?:video|clip|movie)?\s*(?:of\s+)?(.+)",
+        cleaned,
+        re.I,
+    )
+    if play_match:
+        target = _clean_click_target(play_match.group(1))
+        if target:
+            try:
+                name, arguments = validate_call("click_element", {"target": target})
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched play phrase.", user_text=text)
+
+    # "send (a whatsapp) message to X saying Y" / "send this message to X"
+    whatsapp_call = _send_message_from_request(text)
+    if whatsapp_call is not None:
+        return whatsapp_call
 
     # Opening WhatsApp defaults to WhatsApp Web in Edge, not the standalone app.
     if re.fullmatch(r"(?:please\s+)?(?:open|launch|start)\s+(?:the\s+)?whatsapp(?:\s+(?:web|desktop))?", original, re.I):
@@ -1115,6 +1236,65 @@ def fast_route(text: str) -> ToolCall | None:
             return None
         return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                         reasoning="Matched shortcut-save phrase.", user_text=text)
+    # "remember rahul as +91 98765 43210" / "save contact rahul 9876543210"
+    contact_match = re.match(
+        r"^(?:remember|save|add)\s+(?:the\s+)?(?:contact\s+)?(.+?)\s+(?:as|is|=|->|→)\s*(\+?[0-9][0-9\s().-]{6,}[0-9])\s*[.!?]*$",
+        original,
+        re.I,
+    ) or re.match(
+        r"^(?:save|add)\s+contact\s+(.+?)\s+(\+?[0-9][0-9\s().-]{6,}[0-9])\s*[.!?]*$",
+        original,
+        re.I,
+    )
+    if contact_match:
+        contact_name = contact_match.group(1).strip().strip("\"'")
+        contact_number = contact_match.group(2).strip()
+        if contact_name and contact_name.lower() not in {"the message", "a message", "this message", "the draft", "a draft"}:
+            try:
+                name, arguments = validate_call(
+                    "memory", {"action": "set_contact", "alias": contact_name, "target": contact_number}, text
+                )
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched contact-save phrase.", user_text=text)
+
+    # "remember the message buy milk" / "save draft: pick up groceries" -> saved draft
+    draft_match = re.match(
+        r"^(?:remember|save|set|note)\s+(?:this\s+|the\s+)?(?:draft|message|text)\s*(?::|saying|that\s+says)?\s*(.+)$",
+        original,
+        re.I,
+    )
+    if draft_match and draft_match.group(1).strip().strip(".!?"):
+        draft_text = draft_match.group(1).strip().strip("\"'")
+        try:
+            name, arguments = validate_call(
+                "memory", {"action": "set_preference", "key": "draft", "value": draft_text}, text
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched draft-save phrase.", user_text=text)
+
+    # "list contacts" / "show my contacts" / "forget the contact rahul"
+    if re.fullmatch(r"(?:list|show|what\s+are|who\s+are)\s+(?:my\s+)?(?:saved\s+)?contacts[.!?]*", cleaned, re.I):
+        try:
+            name, arguments = validate_call("memory", {"action": "list_contacts"}, text)
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched list-contacts phrase.", user_text=text)
+    forget_contact = re.fullmatch(r"(?:forget|delete|remove)\s+(?:the\s+)?contact\s+(.+?)[.!?]*", cleaned, re.I)
+    if forget_contact:
+        try:
+            name, arguments = validate_call(
+                "memory", {"action": "delete_contact", "alias": forget_contact.group(1).strip()}, text
+            )
+        except ValueError as exc:
+            return ToolCall(name=None, user_text=text, source="fast", error=str(exc), reasoning=str(exc))
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched delete-contact phrase.", user_text=text)
+
     if sleep_match:
         try:
             name, arguments = validate_call("system_control", {"action": "sleep"})
@@ -1363,6 +1543,8 @@ def badge_text(call: ToolCall) -> str:
         detail = str(call.arguments.get("action", ""))
         if call.arguments.get("url"):
             detail = f"{detail} {call.arguments['url']}"
+    elif call.name == "send_message":
+        detail = f"to {call.arguments.get('recipient', '')}"
     elif call.name == "memory":
         detail = str(call.arguments.get("action", ""))
     elif call.name == "schedule":
@@ -1434,6 +1616,13 @@ def describe_call(call: ToolCall) -> str:
         if url:
             return f"Browser: {action} {url}"
         return f"Browser: {action}"
+    if call.name == "send_message":
+        recipient = str(call.arguments.get("recipient", "the contact"))
+        text = str(call.arguments.get("text", "")).strip()
+        if not text:
+            return f"Opening WhatsApp for {recipient} with your saved draft"
+        short = text if len(text) <= 60 else text[:57] + "..."
+        return f"Opening WhatsApp for {recipient}: \"{short}\""
     if call.name == "memory":
         return f"Memory: {call.arguments.get('action', 'action')}"
     if call.name == "schedule":
