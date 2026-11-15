@@ -655,22 +655,31 @@ def _open_app_from_request(text: str) -> str | None:
     return name or None
 
 
+_GENERIC_RECIPIENTS = {"someone", "somebody", "anyone", "anybody", "a contact",
+                       "friend", "them", "him", "her", "everyone"}
+
+_WA_ARTICLE = r"(?:(?:an?|some|any|this|that|the)\s+)?"
 _WA_TEXT_PATTERNS = [
     # "send a whatsapp message to rahul saying I'm late" /
-    # "send a message to rahul that says ..." / "send a message to rahul: ..."
-    r"^(?:send|write|compose)\s+(?:an?\s+)?(?:whatsapp\s+)?(?:message|msg|text)\s+to\s+(.+?)\s+(?:saying|that\s+says|with\s+(?:the\s+)?(?:message|text)|:)\s*(.+)$",
+    # "send some message on whatsapp to rahul saying ..." /
+    # "send a message to rahul: ..." / "send a message on whatsapp to rahul: ..."
+    rf"^(?:send|write|compose)\s+{_WA_ARTICLE}(?:whatsapp\s+)?(?:message|msg|text)\s+(?:on\s+whatsapp\s+)?to\s+(.+?)\s+(?:saying|that\s+says|with\s+(?:the\s+)?(?:message|text)|:)\s*(.+)$",
     # "send rahul a whatsapp message saying ..." / "message rahul a whatsapp message: ..."
-    r"^(?:send|message|text|whatsapp)\s+(.+?)\s+(?:an?\s+)?whatsapp\s+(?:message|msg|text)\s+(?:saying|that\s+says|:)\s*(.+)$",
+    rf"^(?:send|message|text|whatsapp)\s+(.+?)\s+{_WA_ARTICLE}(?:whatsapp\s+)?(?:message|msg|text)\s+(?:on\s+whatsapp\s+)?(?:saying|that\s+says|:)\s*(.+)$",
     # "whatsapp rahul saying ..." / "whatsapp rahul: ..." / "send whatsapp to rahul: ..."
     r"^(?:send\s+)?whatsapp\s+(?:to\s+)?(.+?)\s*(?::\s*|\s+saying\s+|\s+that\s+says\s+)\s*(.+)$",
     # "tell rahul on whatsapp I'm late" / "tell rahul on whatsapp that ..."
     r"^tell\s+(.+?)\s+on\s+whatsapp\s+(?:that\s+|saying\s+)?(.+)$",
     # "message rahul saying ..." / "message rahul on whatsapp saying ..." / "message rahul: ..."
     r"^message\s+(.+?)\s+(?:on\s+whatsapp\s+)?(?:saying|that\s+says|:)\s*(.+)$",
-    # "send rahul a message saying ..." / "send rahul message: ..."
-    r"^send\s+(.+?)\s+(?:an?\s+)?(?:whatsapp\s+)?(?:message|msg|text)\s+(?:saying|that\s+says|:)\s*(.+)$",
-    # "text rahul saying ..." / "text rahul ..." with explicit separator
+    # "send rahul a message saying ..." / "send rahul some message: ..."
+    rf"^send\s+(.+?)\s+{_WA_ARTICLE}(?:whatsapp\s+)?(?:message|msg|text)\s+(?:saying|that\s+says|:)\s*(.+)$",
+    # "text rahul saying ..."
     r"^(?:text|message)\s+(.+?)\s+saying\s+(.+)$",
+    # "message to rahul saying ..."
+    r"^message\s+to\s+(.+?)\s+saying\s+(.+)$",
+    # "send message rahul saying ..."
+    r"^send\s+message\s+(.+?)\s+saying\s+(.+)$",
 ]
 
 _WA_DRAFT_PATTERNS = [
@@ -679,9 +688,14 @@ _WA_DRAFT_PATTERNS = [
     # "send this to rahul (on whatsapp)"
     r"^(?:send|deliver)\s+this\s+to\s+(.+?)(?:\s+on\s+whatsapp)?[.!?]*$",
     # "send a (whatsapp) message to rahul" with no explicit text -> saved draft
-    r"^(?:send|write|compose)\s+(?:an?\s+)?(?:whatsapp\s+)?(?:message|msg|text)\s+to\s+(.+?)(?:\s+on\s+whatsapp)?[.!?]*$",
+    # ("send some message on whatsapp to rahul" works too)
+    rf"^(?:send|write|compose)\s+{_WA_ARTICLE}(?:whatsapp\s+)?(?:message|msg|text)\s+(?:on\s+whatsapp\s+)?to\s+(.+?)(?:\s+(?:on|in)\s+(?:whatsapp|wa))?[.!?]*$",
+    # "message to rahul" -> draft
+    r"^message\s+to\s+(.+?)(?:\s+on\s+whatsapp)?[.!?]*$",
     # "tell rahul on whatsapp" -> draft
     r"^tell\s+(.+?)\s+on\s+whatsapp[.!?]*$",
+    # "whatsapp rahul" -> draft (but not "whatsapp web/desktop/app")
+    r"^whatsapp\s+(?:to\s+)?(.+?)[.!?]*$",
 ]
 
 
@@ -693,6 +707,18 @@ def _strip_whatsapp_suffix(value: str) -> str:
 
 
 def _whatsapp_call(text: str, recipient: str, message: str) -> ToolCall:
+    lowered = (recipient or "").strip().lower()
+    if lowered in _GENERIC_RECIPIENTS:
+        # The caller wants a message but never said whom to message.
+        # Mark it for a two-step clarification instead of failing.
+        return ToolCall(
+            name=None,
+            arguments={"text": message},
+            source="clarify",
+            user_text=text,
+            error="Tell me who to message by name, e.g. 'send a whatsapp message to rahul saying I'm late'.",
+            reasoning="Asked for the recipient.",
+        )
     try:
         name, arguments = validate_call("send_message", {"recipient": recipient, "text": message}, text)
     except ValueError as exc:
@@ -719,9 +745,25 @@ def _send_message_from_request(text: str) -> ToolCall | None:
         if not match:
             continue
         recipient = _strip_whatsapp_suffix(match.group(1))
+        # "whatsapp web/desktop/app" means open, not message.
+        if recipient.lower() in {"web", "desktop", "app"}:
+            return None
         if recipient:
             # Text resolved at execution time: the saved draft, or a clear error.
             return _whatsapp_call(text, recipient, "")
+    # WhatsApp-and-message-ish commands we can't parse should get a helpful
+    # error rather than the generic "cannot map" from the model.
+    if re.search(r"\bwhatsapp\b", original, re.I) and re.search(
+        r"\b(send|message|msg|text|tell|write|compose)\b", original, re.I
+    ):
+        return ToolCall(
+            name=None,
+            user_text=text,
+            source="fast",
+            error="Tell me who to message and what the message should say, "
+                  "e.g. 'send a whatsapp message to rahul saying I'm late'.",
+            reasoning="Unparsed WhatsApp-message command.",
+        )
     return None
 
 
@@ -1385,13 +1427,16 @@ def fast_route(text: str) -> ToolCall | None:
                         reasoning="Matched focus-window phrase.", user_text=text)
 
     first_link = re.fullmatch(
-        r"(?:please\s+)?(?:open|click|tap|follow|select)\s+(?:the\s+)?(?:first|top)\s+(?:link|result|page|one)(?:\s+(?:in|on)\s+[^.]+)?",
+        r"(?:please\s+)?(?:open|click|tap|follow|select)\s+(?:the\s+)?(?:first|top)\s+(?:link|result|page|one)(?:\s+(?:in|on)\s+(?:the\s+)?(edge|chrome|firefox|brave|opera))?",
         cleaned,
         re.I,
     )
     if first_link:
+        arguments: dict[str, object] = {"action": "click_first_result"}
+        if first_link.group(1):
+            arguments["browser"] = first_link.group(1).lower()
         try:
-            name, arguments = validate_call("browser_control", {"action": "click_first_result"})
+            name, arguments = validate_call("browser_control", arguments)
         except ValueError:
             return None
         return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,

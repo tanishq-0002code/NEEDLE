@@ -402,6 +402,10 @@ class DesktopAutomation:
         self._lock = threading.RLock()
         self._resolver = AppResolver()
         self._gui_ready = False
+        self._scheduler = None
+        self._last_plan_steps: list[str] = []
+        self._last_browser_exe = ""
+        self._last_browser_hwnd = 0
 
     def _prepare_gui(self) -> None:
         if self._gui_ready:
@@ -958,22 +962,33 @@ class DesktopAutomation:
             raise AutomationError("UI element search is unavailable on this system.") from exc
         comtypes.CoInitialize()
         try:
-            auto.SetGlobalSearchTimeout(2.0)
-            root = auto.ControlFromHandle(hwnd) if hwnd else auto.GetRootControl()
-            if root is None:
-                root = auto.GetRootControl()
-            wanted = target.strip().lower()
+            auto.SetGlobalSearchTimeout(1.5)
+            candidates: list[int] = []
+            if hwnd:
+                candidates.append(hwnd)
+            _active_exe, active_hwnd = self._active_browser()
+            if active_hwnd and active_hwnd not in candidates:
+                candidates.append(active_hwnd)
+
             found = None
-            for kwargs in ({"SubName": target}, {"Name": target}):
+            for candidate_hwnd in candidates:
                 try:
-                    candidate = root.Control(searchDepth=12, **kwargs)
-                    if candidate and candidate.Exists(0.2):
-                        found = candidate
-                        break
+                    root = auto.ControlFromHandle(candidate_hwnd)
                 except Exception:
+                    root = None
+                if root is None:
                     continue
-            if found is None:
-                found = self._walk_uia(root, wanted, max_depth=10, max_nodes=600)
+                is_browser = self._process_name_for_hwnd(candidate_hwnd) in self._BROWSER_PROCESSES
+                found = self._find_uia_control(root, target, interactive_only=is_browser)
+                if found is not None:
+                    break
+            if found is None and not candidates:
+                try:
+                    found = self._find_uia_control(
+                        auto.GetRootControl(), target, max_depth=12, max_nodes=6000
+                    )
+                except Exception:
+                    found = None
             if found is None:
                 raise AutomationError(
                     f"I couldn't find a visible control named \"{target}\" in the foreground window."
@@ -982,13 +997,9 @@ class DesktopAutomation:
                 found.SetFocus()
             except Exception:
                 pass
-            if button == "left" and clicks == 1:
-                try:
-                    found.Click(simulateMove=False)
-                    time.sleep(0.1)
-                    return
-                except Exception:
-                    pass
+            if button == "left" and clicks == 1 and self._activate_uia_control(found):
+                time.sleep(0.1)
+                return
             try:
                 point = found.GetClickablePoint()
                 self._mouse_click(int(point.x), int(point.y), button=button, clicks=clicks)
@@ -1002,28 +1013,217 @@ class DesktopAutomation:
                 pass
 
     @staticmethod
-    def _walk_uia(root, wanted: str, max_depth: int, max_nodes: int):
-        queue = [(root, 0)]
+    def _control_name_score(name: str, wanted: str, tokens: list[str]) -> float:
+        if not name or not wanted:
+            return 0.0
+        if name == wanted:
+            return 1.0
+        if wanted in name:
+            return 0.92
+        if name in wanted and len(name) >= 4:
+            return 0.86
+        if not tokens:
+            return 0.0
+        present = sum(1 for token in tokens if token in name)
+        if present == len(tokens):
+            token_score = 0.82
+        elif present:
+            token_score = 0.55 * (present / len(tokens))
+        else:
+            token_score = 0.0
+        ratio = difflib.SequenceMatcher(None, wanted, name).ratio()
+        return max(token_score, ratio * 0.8)
+
+    @classmethod
+    def _find_uia_control(
+        cls,
+        root,
+        target: str,
+        max_depth: int = 30,
+        max_nodes: int = 20000,
+        interactive_only: bool = False,
+    ):
+        try:
+            import uiautomation as auto
+        except Exception:
+            return None
+        wanted = _norm(target)
+        tokens = [token for token in wanted.split() if token]
+        if not wanted:
+            return None
+        interactive_types = {
+            "HyperlinkControl", "ButtonControl", "MenuItemControl", "TabItemControl",
+            "ListItemControl", "CheckBoxControl", "RadioButtonControl",
+            "SplitButtonControl", "TreeItemControl", "DataItemControl",
+        }
+        best = None
+        best_score = 0.0
         seen = 0
-        while queue and seen < max_nodes:
-            control, depth = queue.pop(0)
-            seen += 1
+        try:
+            for control, _depth in auto.WalkControl(root, includeTop=True, maxDepth=max_depth):
+                seen += 1
+                if seen > max_nodes:
+                    break
+                try:
+                    name = _norm(control.Name or "")
+                except Exception:
+                    continue
+                if not name:
+                    continue
+                try:
+                    control_type = control.ControlTypeName or ""
+                except Exception:
+                    control_type = ""
+                if interactive_only and control_type and control_type not in interactive_types:
+                    continue
+                score = cls._control_name_score(name, wanted, tokens)
+                if score < 0.55:
+                    continue
+                if control_type == "HyperlinkControl":
+                    score += 0.10
+                elif control_type in {"ButtonControl", "MenuItemControl", "TabItemControl", "ListItemControl"}:
+                    score += 0.05
+                elif control_type not in {"TextControl"}:
+                    score -= 0.02
+                try:
+                    if control.IsOffscreen:
+                        score -= 0.30
+                except Exception:
+                    pass
+                if score > best_score:
+                    best_score = score
+                    best = control
+        except Exception:
+            return best
+        return best if best_score >= 0.55 else None
+
+    @staticmethod
+    def _activate_uia_control(control) -> bool:
+        try:
+            pattern = control.GetInvokePattern()
+            if pattern is not None:
+                pattern.Invoke()
+                return True
+        except Exception:
+            pass
+        try:
+            control.Click(simulateMove=False)
+            return True
+        except Exception:
+            pass
+        try:
+            point = control.GetClickablePoint()
+            import pyautogui
+
+            pyautogui.click(int(point.x), int(point.y))
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_browser_chrome_link(name: str, rect: tuple[int, int, int, int],
+                                window_rect: tuple[int, int, int, int]) -> bool:
+        left, top, right, bottom = rect
+        wx0, wy0, wx1, wy1 = window_rect
+        if right <= left or bottom <= top:
+            return True
+        if right <= wx0 or left >= wx1 or bottom <= wy0 or top >= wy1:
+            return True
+        # Skip the tab strip / toolbar / address bar region.
+        if top < wy0 + 150:
+            return True
+        lowered = (name or "").strip().lower()
+        if len(lowered) < 6:
+            return True
+        blocked = {
+            "all", "web", "web mode", "ai mode", "copilot", "copilot search branding",
+            "shopping", "images", "videos", "maps", "news", "more", "sign in",
+            "rewards", "settings", "manage favorites now", "back to bing search",
+            "explore this image", "all images", "web page related images",
+            "related searches", "show all", "show more", "skip to main content",
+            "accessibility feedback", "go to google home", "overview",
+            "usage examples", "similar and opposite words", "pronunciation",
+            "learn more", "oxford languages", "forums", "short videos", "books",
+            "flights", "finance", "tools", "search tools", "more results",
+            "try without personalisation",
+        }
+        if lowered in blocked:
+            return True
+        if lowered.startswith(("see results only from", "see more", "show more", "more results")):
+            return True
+        # Short toolbar/filter pills and tab labels are not search results.
+        if (right - left) < 220 and (bottom - top) < 55:
+            return True
+        return False
+
+    def _first_visible_result_link(self, hwnd: int):
+        try:
+            import comtypes
+            import uiautomation as auto
+        except Exception:
+            return None
+        comtypes.CoInitialize()
+        try:
+            auto.SetGlobalSearchTimeout(1.5)
+            root = auto.ControlFromHandle(hwnd)
+            if root is None:
+                return None
+            window_rect = win.get_window_rect(hwnd)
+            preferred: list[tuple[int, int, object]] = []
+            seen = 0
+            for control, _depth in auto.WalkControl(root, includeTop=True, maxDepth=30):
+                seen += 1
+                if seen > 20000:
+                    break
+                try:
+                    if control.ControlTypeName != "HyperlinkControl":
+                        continue
+                    name = str(control.Name or "").strip()
+                    if not name or control.IsOffscreen:
+                        continue
+                    r = control.BoundingRectangle
+                    rect = (int(r.left), int(r.top), int(r.right), int(r.bottom))
+                except Exception:
+                    continue
+                if self._is_browser_chrome_link(name, rect, window_rect):
+                    continue
+
+                is_preferred = False
+                skip = False
+                try:
+                    parent = control
+                    for _ in range(8):
+                        parent = parent.GetParentControl()
+                        if parent is None:
+                            break
+                        parent_name = str(parent.Name or "").strip().lower()
+                        if parent_name in {"additional results", "related searches"}:
+                            skip = True
+                            break
+                        if "copilot search" in parent_name:
+                            skip = True
+                            break
+                        if parent_name == "search results":
+                            is_preferred = True
+                except Exception:
+                    pass
+                if skip or not is_preferred:
+                    continue
+                preferred.append((rect[1], rect[0], control))
+            # Only trust links that sit inside the engine's search-results
+            # region. This avoids clicking AI-overview cards, tab labels, or
+            # related-search suggestions when the real results are below them.
+            if not preferred:
+                return None
+            preferred.sort(key=lambda item: (item[0], item[1]))
+            return preferred[0][2]
+        except Exception:
+            return None
+        finally:
             try:
-                name = (control.Name or "").strip().lower()
-                automation_id = (control.AutomationId or "").strip().lower()
-                if wanted and (wanted in name or wanted in automation_id):
-                    return control
+                comtypes.CoUninitialize()
             except Exception:
                 pass
-            if depth >= max_depth:
-                continue
-            try:
-                children = control.GetChildren()
-            except Exception:
-                children = []
-            for child in children:
-                queue.append((child, depth + 1))
-        return None
 
     def _grab_screen_image(self):
         """Captures the screen using Windows GDI BitBlt, with PyQt6 and PIL fallbacks."""
@@ -1557,36 +1757,106 @@ class DesktopAutomation:
         # 2. Title-substring fallback.
         return [info for info in win.enumerate_windows() if wanted in info.title.lower()]
 
+    _BROWSER_EXE_NAMES = {
+        "chrome": "chrome.exe",
+        "google chrome": "chrome.exe",
+        "edge": "msedge.exe",
+        "microsoft edge": "msedge.exe",
+        "firefox": "firefox.exe",
+        "brave": "brave.exe",
+        "opera": "opera.exe",
+    }
+    _BROWSER_DISPLAY_NAMES = {
+        "chrome.exe": "Google Chrome",
+        "msedge.exe": "Microsoft Edge",
+        "firefox.exe": "Firefox",
+        "brave.exe": "Brave",
+        "opera.exe": "Opera",
+    }
+
+    @staticmethod
+    def _process_name_for_hwnd(hwnd: int) -> str:
+        if not hwnd:
+            return ""
+        try:
+            pid = win.get_window_pid(hwnd)
+            if not pid:
+                return ""
+            return psutil.Process(pid).name().lower()
+        except (psutil.Error, OSError):
+            return ""
+
+    def _browser_exe_path(self, exe_name: str) -> str:
+        name = str(exe_name or "").strip().lower()
+        if not name:
+            return ""
+        if not name.endswith(".exe"):
+            name = self._BROWSER_EXE_NAMES.get(name, name + ".exe")
+        for candidate in _candidate_paths(name):
+            try:
+                if candidate.exists():
+                    return str(candidate)
+            except OSError:
+                continue
+        return ""
+
+    def _active_browser(self) -> tuple[str, int]:
+        """Return the browser the user is most likely using.
+
+        The foreground window wins when it is a browser; otherwise the topmost
+        visible browser window in z-order is used. This keeps commands on Edge
+        when the user is in Edge even if another browser is also running.
+        """
+        foreground = win.get_foreground_window()
+        proc_name = self._process_name_for_hwnd(foreground)
+        if proc_name in self._BROWSER_PROCESSES:
+            self._remember_browser(proc_name, foreground)
+            return proc_name, foreground
+
+        for info in win.enumerate_windows():
+            proc_name = self._process_name_for_hwnd(info.hwnd)
+            if proc_name not in self._BROWSER_PROCESSES:
+                continue
+            if win.is_minimized(info.hwnd):
+                continue
+            self._remember_browser(proc_name, info.hwnd)
+            return proc_name, info.hwnd
+        return self._last_browser_exe, 0
+
+    def _remember_browser(self, exe_name: str, hwnd: int = 0) -> None:
+        name = str(exe_name or "").strip().lower()
+        if name:
+            self._last_browser_exe = name
+        if hwnd:
+            self._last_browser_hwnd = hwnd
+
     def _find_browser_window(self, browser: str | None) -> int:
         wanted_proc = None
         if browser:
             name = browser.strip().lower()
-            known = {
-                "chrome": "chrome.exe",
-                "google chrome": "chrome.exe",
-                "edge": "msedge.exe",
-                "microsoft edge": "msedge.exe",
-                "firefox": "firefox.exe",
-                "brave": "brave.exe",
-                "opera": "opera.exe",
-            }
-            wanted_proc = known.get(name, name if name.endswith(".exe") else name + ".exe")
-        for info in win.enumerate_windows():
-            if not info.title.strip():
-                continue
-            if wanted_proc:
-                try:
-                    proc_name = psutil.Process(info.pid).name().lower()
-                except psutil.Error:
-                    proc_name = ""
-                if proc_name != wanted_proc.lower():
+            wanted_proc = self._BROWSER_EXE_NAMES.get(
+                name, name if name.endswith(".exe") else name + ".exe"
+            )
+        if wanted_proc:
+            for info in win.enumerate_windows():
+                if self._process_name_for_hwnd(info.hwnd) != wanted_proc:
                     continue
+                if win.is_minimized(info.hwnd):
+                    continue
+                if not info.title.strip():
+                    continue
+                self._remember_browser(wanted_proc, info.hwnd)
                 return info.hwnd
-            try:
-                proc_name = psutil.Process(info.pid).name().lower()
-            except psutil.Error:
-                proc_name = ""
-            if proc_name in self._BROWSER_PROCESSES:
+            return 0
+
+        proc_name, hwnd = self._active_browser()
+        if hwnd:
+            self._remember_browser(proc_name, hwnd)
+            return hwnd
+
+        # Last-resort: any visible browser window.
+        for info in win.enumerate_windows():
+            if self._process_name_for_hwnd(info.hwnd) in self._BROWSER_PROCESSES:
                 return info.hwnd
         return 0
 
@@ -1603,15 +1873,45 @@ class DesktopAutomation:
                     url = "https://" + url
                 else:
                     raise AutomationError("Only http, https, file, or mailto URLs are allowed.")
-            if browser:
-                resolved = self._resolver.resolve(browser)
-                if resolved.kind == "exe" and Path(resolved.target).exists():
+            requested = str(browser or "").strip().lower()
+            exe_name = ""
+            display_name = ""
+            if requested:
+                exe_name = self._BROWSER_EXE_NAMES.get(
+                    requested,
+                    requested if requested.endswith(".exe") else requested + ".exe",
+                )
+                display_name = self._BROWSER_DISPLAY_NAMES.get(exe_name, requested.title())
+            else:
+                active_exe, active_hwnd = self._active_browser()
+                if active_exe:
+                    exe_name = active_exe
+                    display_name = self._BROWSER_DISPLAY_NAMES.get(active_exe, active_exe)
+                    self._remember_browser(active_exe, active_hwnd)
+                elif self._last_browser_exe:
+                    exe_name = self._last_browser_exe
+                    display_name = self._BROWSER_DISPLAY_NAMES.get(exe_name, exe_name)
+
+            exe_path = self._browser_exe_path(exe_name) if exe_name else ""
+            if not exe_path and requested:
+                try:
+                    resolved = self._resolver.resolve(requested)
+                except Exception:
+                    resolved = None
+                if resolved is not None and resolved.kind == "exe" and Path(resolved.target).exists():
+                    exe_path = resolved.target
+                    display_name = resolved.display_name
+            if exe_path:
+                try:
                     subprocess.Popen(
-                        [resolved.target, url],
+                        [exe_path, url],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                    return ExecutionResult(True, f"Opened {url} in {resolved.display_name}.", "browser_control")
+                except OSError as exc:
+                    raise AutomationError(f"Could not open the URL in {display_name}: {exc}") from exc
+                self._remember_browser(Path(exe_path).name.lower())
+                return ExecutionResult(True, f"Opened {url} in {display_name}.", "browser_control")
             try:
                 os.startfile(url)  # type: ignore[attr-defined]
             except OSError as exc:
@@ -1664,94 +1964,134 @@ class DesktopAutomation:
             if not hwnd:
                 raise AutomationError("No browser window was found. Open a browser first.")
             win.focus_window(hwnd)
-            time.sleep(0.3)
+            time.sleep(0.35)
 
-            # Copy the address bar by focusing it and selecting/copying.
             import pyperclip, urllib.parse
             from pynput.keyboard import Controller, Key
 
-            previous_clipboard = pyperclip.paste()
             controller = Controller()
-            with controller.pressed(Key.ctrl):
-                controller.press("l")
-                controller.release("l")
-            time.sleep(0.25)
-            with controller.pressed(Key.ctrl):
-                controller.press("a")
-                controller.release("a")
-            time.sleep(0.1)
-            with controller.pressed(Key.ctrl):
-                controller.press("c")
-                controller.release("c")
-            time.sleep(0.25)
-            address = pyperclip.paste()
-            pyperclip.copy(previous_clipboard)
 
-            if not address or not re.match(r"^https?://", address, re.I):
-                raise AutomationError("Could not read the browser's address bar.")
-            if "search" not in address.lower():
-                raise AutomationError(
-                    "'Open first link' is only supported on a search results page."
-                )
-
-            try:
-                import requests
-                from bs4 import BeautifulSoup
-                import urllib.parse
-
-                parsed = urllib.parse.urlparse(address)
-                query_dict = urllib.parse.parse_qs(parsed.query)
-                query = query_dict.get("q", [""])[0]
-                if not query:
-                    raise AutomationError(
-                        "Could not find a search query in the address bar. "
-                        "Search for something first, then ask again."
-                    )
-
-                search_url = "https://www.bing.com/search?q=" + urllib.parse.quote(query)
-                response = requests.get(
-                    search_url,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0 Safari/537.36"
-                        )
-                    },
-                    timeout=(10.0, 30.0),
-                )
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, "html.parser")
-                link = soup.select_one("li.b_algo h2 a")
-                if not link:
-                    raise AutomationError("No result link was found on the search page.")
-                first_link = link.get("href")
-                if not first_link:
-                    raise AutomationError("No result link was found on the search page.")
-                # Bing wraps results in a redirect URL with the destination
-                # base64-encoded in a `u=a1` query parameter. Decode it so the
-                # link opens directly instead of going through Bing's redirect.
-                from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs, unquote as _unquote
-                import base64 as _base64
-
+            def _read_address() -> str:
+                previous_clipboard = pyperclip.paste()
+                with controller.pressed(Key.ctrl):
+                    controller.press("l")
+                    controller.release("l")
+                time.sleep(0.25)
+                with controller.pressed(Key.ctrl):
+                    controller.press("a")
+                    controller.release("a")
+                time.sleep(0.1)
+                with controller.pressed(Key.ctrl):
+                    controller.press("c")
+                    controller.release("c")
+                time.sleep(0.25)
+                value = pyperclip.paste() or ""
+                pyperclip.copy(previous_clipboard)
                 try:
-                    redirect_query = _parse_qs(_urlparse(first_link).query)
-                    encoded = (redirect_query.get("u") or [""])[0]
-                    if encoded.startswith("a1"):
-                        raw = encoded[2:]
-                        padding = "=" * (-len(raw) % 4)
-                        destination = _base64.b64decode(raw + padding).decode("utf-8", "ignore")
-                        if destination.startswith("http"):
-                            first_link = destination
+                    controller.press(Key.esc)
+                    controller.release(Key.esc)
                 except Exception:
                     pass
+                return str(value)
+
+            # Prefer ranking the query with a text-friendly engine. Google
+            # serves a JS-only page to anonymous requests, so Bing's HTML
+            # results are the reliable source of organic links.
+            scrape_error = ""
+            address = _read_address()
+            if address and re.match(r"^https?://", address, re.I):
+                parsed = urllib.parse.urlparse(address)
+                query_dict = urllib.parse.parse_qs(parsed.query)
+                query = ""
+                for key in ("q", "query", "p", "text", "search"):
+                    values = query_dict.get(key) or []
+                    if values and str(values[0]).strip():
+                        query = str(values[0]).strip()
+                        break
+                if query:
+                    try:
+                        import requests
+                        from bs4 import BeautifulSoup
+
+                        search_url = "https://www.bing.com/search?q=" + urllib.parse.quote(query)
+                        response = requests.get(
+                            search_url,
+                            headers={
+                                "User-Agent": (
+                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                    "Chrome/120.0 Safari/537.36"
+                                )
+                            },
+                            timeout=(10.0, 30.0),
+                        )
+                        response.raise_for_status()
+                        soup = BeautifulSoup(response.text, "html.parser")
+                        result = soup.select_one("li.b_algo h2 a")
+                        if not result:
+                            raise AutomationError("No result link was found on the search page.")
+                        first_link = result.get("href")
+                        if not first_link:
+                            raise AutomationError("No result link was found on the search page.")
+                        # Bing wraps results in a redirect URL with the destination
+                        # base64-encoded in a `u=a1` query parameter. Decode it so
+                        # the link opens directly instead of going through Bing.
+                        from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+                        import base64 as _base64
+
+                        try:
+                            redirect_query = _parse_qs(_urlparse(first_link).query)
+                            encoded = (redirect_query.get("u") or [""])[0]
+                            if encoded.startswith("a1"):
+                                raw = encoded[2:]
+                                padding = "=" * (-len(raw) % 4)
+                                destination = _base64.b64decode(raw + padding).decode("utf-8", "ignore")
+                                if destination.startswith("http"):
+                                    first_link = destination
+                        except Exception:
+                            pass
+
+                        target_exe = self._browser_exe_path(browser) if browser else ""
+                        if not target_exe:
+                            active_exe, _ = self._active_browser()
+                            target_exe = self._browser_exe_path(active_exe) if active_exe else ""
+                        if target_exe:
+                            subprocess.Popen(
+                                [target_exe, first_link],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                        else:
+                            try:
+                                os.startfile(first_link)
+                            except AttributeError:
+                                subprocess.Popen([first_link], close_fds=True)
+                        return ExecutionResult(
+                            True, f"Opened the first result: {first_link}", "browser_control"
+                        )
+                    except Exception as exc:
+                        scrape_error = str(exc)
+
+            # Fallback: click the first visible link inside the page itself.
+            link = self._first_visible_result_link(hwnd)
+            if link is not None:
                 try:
-                    os.startfile(first_link)
-                except AttributeError:
-                    subprocess.Popen([first_link], close_fds=True)
-                return ExecutionResult(True, f"Opened the first result: {first_link}", "browser_control")
-            except Exception as exc:
-                raise AutomationError(f"Could not open the first result: {exc}") from exc
+                    link_name = str(link.Name or "").strip()
+                except Exception:
+                    link_name = ""
+                if self._activate_uia_control(link):
+                    return ExecutionResult(
+                        True,
+                        f"Opened the first result: {link_name or 'link'}",
+                        "browser_control",
+                    )
+
+            if scrape_error:
+                raise AutomationError(f"Could not open the first result: {scrape_error}")
+            raise AutomationError(
+                "Could not find a search query in the address bar. "
+                "Search for something first, then ask again."
+            )
         if action == "tab_close":
             target = str(target or "").strip()
             if target:
@@ -1850,13 +2190,6 @@ class DesktopAutomation:
         if len(text) > 4000:
             text = text[:3997] + "..."
         return ExecutionResult(True, f"Page text:\n{text}", "browser_control")
-
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._resolver = AppResolver()
-        self._gui_ready = False
-        self._scheduler = None
-        self._last_plan_steps: list[str] = []
 
     def set_scheduler(self, scheduler) -> None:
         self._scheduler = scheduler
@@ -1962,9 +2295,9 @@ class DesktopAutomation:
             text = text[:3000]
         url = "https://wa.me/" + number + "?text=" + urllib.parse.quote(text, safe="")
         try:
-            os.startfile(url)  # type: ignore[attr-defined]
-        except OSError as exc:
-            raise AutomationError(f"Could not open WhatsApp: {exc}") from exc
+            self._browser_control("open_url", url, browser="edge")
+        except AutomationError as exc:
+            raise AutomationError(f"Could not open WhatsApp in Edge: {exc}") from exc
         suffix = " (used your saved draft)" if used_draft else ""
         return ExecutionResult(
             True,

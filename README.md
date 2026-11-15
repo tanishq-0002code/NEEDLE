@@ -16,7 +16,7 @@ No cloud AI APIs, no accounts, and no telemetry. The microphone, speech recognit
 
 ## Tool catalog
 
-The router is restricted to exactly six tools:
+The router is restricted to a fixed local catalog in `needle_assistant/catalog.py` (core examples below):
 
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
@@ -26,8 +26,25 @@ The router is restricted to exactly six tools:
 | `press_hotkey` | `keys` | Press a shortcut such as `ctrl+c` or `alt+tab` |
 | `take_screenshot` | — | Save a screenshot to `Pictures\Needle` |
 | `control_media` | `action` | Play, pause, next, previous, mute |
+| `send_message` | `recipient`, `text` | Open WhatsApp to a saved contact or number with the message prefilled |
 
 The model cannot call arbitrary tools. Tool names and arguments are validated again before execution.
+
+## WhatsApp messages
+
+There is no local WhatsApp API, so `send_message` opens a **`wa.me` deep link**: the chat opens with your message prefilled and you press Enter (or the send button) to deliver it. Nothing is sent without that final tap, and no third-party service or account is involved — it is exactly as private as opening a wa.me link in a browser.
+
+One-time setup and dictation:
+
+- “Remember rahul as +91 98765 43210” — saves a contact (stored in `%APPDATA%\NeedleDesktop\memory.json`).
+- “Remember the message running late” — saves a draft; any message text you say later can reuse it.
+- “List contacts” / “forget the contact rahul”.
+- “Send a whatsapp message to rahul saying I’ll be late” — opens WhatsApp to Rahul with that text.
+- “Send this message to rahul on whatsapp” — uses the saved draft.
+- “Whatsapp rahul: on my way”, “tell rahul on whatsapp I will be late” also work.
+- A raw phone number works without a contact: “send a whatsapp message to +91 98765 43210 saying hi”.
+
+If the recipient is not a saved contact or a number, Needle asks who you mean instead of guessing or opening a random chat. If there is no draft and no message text in the command, it tells you what to say rather than sending an empty message.
 
 ## Requirements
 

@@ -236,25 +236,14 @@ class TelegramBot(QObject):
             self._send_html(chat_id, f"Your Telegram chat ID is:\n<code>{chat_id}</code>")
             return
         if not self._authorized(chat_id):
-            if not self._allowed:
-                # Zero-friction auto-pairing for the bot owner
-                self._allowed.add(chat_id)
-                log.info("Telegram bot auto-paired with chat ID %s.", chat_id)
-                if self._on_pair is not None:
-                    try:
-                        self._on_pair(chat_id)
-                    except Exception:
-                        pass
-                self._send(chat_id, f"Needle Desktop paired with chat ID {chat_id}. Processing your command…")
-            else:
-                self._send(
-                    chat_id,
-                    "This Needle bot is not paired with this chat yet.\n\n"
-                    f"Your chat ID is: {chat_id}\n\n"
-                    "Open Needle Desktop → Settings → Telegram and add this ID to "
-                    "Allowed chat IDs. Until then, commands are ignored.",
-                )
-                return
+            self._send(
+                chat_id,
+                "This Needle bot is not paired with this chat yet.\n\n"
+                f"Your chat ID is: {chat_id}\n\n"
+                "Open Needle Desktop → Settings → Telegram and add this ID to "
+                "Allowed chat IDs. Until then, commands are ignored.",
+            )
+            return
 
         if command == "/confirm":
             pending = (

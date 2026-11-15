@@ -11,7 +11,8 @@ from .paths import app_data_dir
 def _redact(arguments: Any) -> Any:
     if not isinstance(arguments, dict):
         return arguments
-    sensitive = {"token", "password", "secret", "key", "credential"}
+    sensitive = {"token", "password", "secret", "key", "credential",
+                 "text", "message", "content", "steps"}
     result: dict[str, Any] = {}
     for key, value in arguments.items():
         if any(word in str(key).lower() for word in sensitive):

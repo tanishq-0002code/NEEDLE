@@ -365,6 +365,8 @@ class AssistantController(QObject):
                 self.notify.emit("Scheduled action failed", result.message)
         except Exception:
             log.debug("Scheduled action failed.", exc_info=True)
+
+    def _handle_undo(self, text: str) -> bool:
         cleaned = " ".join(str(text or "").split()).lower()
         if not cleaned:
             return False
@@ -390,21 +392,93 @@ class AssistantController(QObject):
             self._play_sound("done.wav")
             return True
         return False
+
+    def _launch_clarified_call(self, call: ToolCall, original: str) -> None:
+        self._active = True
+        self._session += 1
+        session = self._session
+        self.overlay.set_thinking(original or call.name or "Working…")
+        interactive = call.name in INTERACTIVE_TOOLS
+        restore = self._foreground_hwnd if interactive else 0
+        if interactive:
+            QTimer.singleShot(120, lambda: self._run_execution(call, restore, session))
+        else:
+            self._run_execution(call, restore, session)
+
+    def _take_clarification(self, text: str) -> bool:
         pending = self._pending_clarification
         if not pending:
             return False
         self._pending_clarification = None
         if time.monotonic() - float(pending.get("created", 0)) > 90:
             return False
+        kind = str(pending.get("kind") or "app")
+        original = str(pending.get("original") or pending.get("text") or "")
+        reply = " ".join(str(text or "").split()).strip()
+        if not reply:
+            self._pending_clarification = pending
+            return True
+        if reply.lower() in {"cancel", "cancel that", "never mind", "stop"}:
+            self.overlay.show_error("Okay, cancelled.")
+            self.overlay.hide_after(1400)
+            self._play_sound("done.wav")
+            return True
+        if kind == "send_message":
+            # First missing slot: whom to message.
+            from . import memory as _memory
+
+            recipient = reply.strip("\"'").rstrip(".!?")
+            digits = re.sub(r"\D", "", recipient)
+            is_number = bool(re.fullmatch(r"\s*\+?[0-9][0-9\s().-]{6,}[0-9]\s*", recipient))
+            if (
+                _memory.get_contact(recipient) is None
+                and not is_number
+                and len(recipient.split()) > 3
+            ):
+                # Not a name or number; fall back to treating it as a new command.
+                return False
+            message = str(pending.get("message") or "")
+            if not message:
+                self._pending_clarification = {
+                    "kind": "send_message_text",
+                    "recipient": recipient,
+                    "created": time.monotonic(),
+                    "original": original,
+                }
+                self.overlay.show_error("What should the message say?")
+                self.overlay.hide_after(3200)
+                return True
+            call = ToolCall(
+                name="send_message",
+                arguments={"recipient": recipient, "text": message},
+                source="clarified",
+                confidence=1.0,
+                user_text=f"{original} (clarified: {recipient})".strip(),
+            )
+            self._launch_clarified_call(call, original)
+            return True
+        if kind == "send_message_text":
+            # Second missing slot: the message body.
+            message = reply.strip()
+            recipient = str(pending.get("recipient") or "")
+            call = ToolCall(
+                name="send_message",
+                arguments={"recipient": recipient, "text": message},
+                source="clarified",
+                confidence=1.0,
+                user_text=f"{original} (clarified: {recipient})".strip(),
+            )
+            self._launch_clarified_call(call, original)
+            return True
+        # kind == "app": pick one of the ambiguous candidates.
         candidates = [str(item) for item in pending.get("candidates", [])]
         if not candidates:
             return False
-        choice = self._match_candidate(text, candidates)
+        choice = self._match_candidate(reply, candidates)
         if choice is None:
             log.info("Clarification answer did not match; treating as a new command.")
             return False
         tool = str(pending.get("tool") or "open_application")
-        original = str(pending.get("text") or "")
         call = ToolCall(
             name=tool,
             arguments={"app_name": choice},
@@ -412,16 +486,7 @@ class AssistantController(QObject):
             confidence=1.0,
             user_text=f"{original} (clarified: {choice})".strip(),
         )
-        self._active = True
-        self._session += 1
-        session = self._session
-        self.overlay.set_thinking(original or f"open {choice}")
-        interactive = tool in INTERACTIVE_TOOLS
-        restore = self._foreground_hwnd if interactive else 0
-        if interactive:
-            QTimer.singleShot(120, lambda: self._run_execution(call, restore, session))
-        else:
-            self._run_execution(call, restore, session)
+        self._launch_clarified_call(call, original)
         return True
 
     def on_route_ready(self, call: ToolCall, session: int) -> None:
@@ -469,6 +534,20 @@ class AssistantController(QObject):
                 pass
         if not call.name:
             message = call.error or call.reasoning or "I couldn't map that to a desktop action."
+            if call.source == "clarify":
+                # The user asked for a message without naming a contact;
+                # ask for the missing slot instead of failing.
+                self._pending_clarification = {
+                    "kind": "send_message",
+                    "message": str(call.arguments.get("text") or ""),
+                    "created": time.monotonic(),
+                    "original": call.user_text or "",
+                }
+                self.overlay.show_error("Who should I send it to?")
+                self.overlay.hide_after(3200)
+                self._play_sound("error.wav")
+                log.info("Asking for the message recipient.")
+                return
             log.warning("Route failed: %s", message)
             self.overlay.show_error(message)
             self.overlay.hide_after(3000)

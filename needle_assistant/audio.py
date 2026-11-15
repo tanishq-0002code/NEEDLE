@@ -69,6 +69,22 @@ def _resample_int16(data: bytes, source_rate: int, target_rate: int = SAMPLE_RAT
     return output.tobytes()
 
 
+def _apply_gain(data: bytes, gain: float) -> bytes:
+    if gain <= 1.02 or not data:
+        return data
+    samples = array("h")
+    samples.frombytes(data)
+    for index in range(len(samples)):
+        val = int(samples[index] * gain)
+        if val > 32767:
+            samples[index] = 32767
+        elif val < -32768:
+            samples[index] = -32768
+        else:
+            samples[index] = val
+    return samples.tobytes()
+
+
 class AudioWorker(threading.Thread):
     def __init__(self, engine: "AudioEngine", config: AppConfig) -> None:
         super().__init__(name="NeedleAudio", daemon=True)
@@ -352,6 +368,9 @@ class AudioWorker(threading.Thread):
                     audio = _resample_int16(audio, self._source_rate, SAMPLE_RATE)
                 if not audio:
                     continue
+                gain = float(getattr(self.config, "mic_gain", 3.0) or 3.0)
+                if gain > 1.02:
+                    audio = _apply_gain(audio, gain)
                 level = self._level(audio)
                 self._emit(self.engine.level_changed, level)
 
@@ -403,7 +422,8 @@ class AudioWorker(threading.Thread):
                     if partial:
                         self._emit(self.engine.partial_text, partial)
                     now = time.monotonic()
-                    if level > 0.045:
+                    threshold = float(getattr(self.config, "mic_energy_threshold", 0.012) or 0.012)
+                    if level > threshold:
                         self._last_voice = now
                         self._heard_voice = True
                     elapsed = now - self._command_started
@@ -464,8 +484,8 @@ class AudioWorker(threading.Thread):
                 if magnitude > peak:
                     peak = magnitude
             rms = math.sqrt(total / len(samples))
-            self._noise_floor = max(40.0, self._noise_floor * 0.97 + rms * 0.03)
-            return min(1.0, max(0.0, (rms - self._noise_floor) / 7000.0))
+            self._noise_floor = max(20.0, self._noise_floor * 0.95 + rms * 0.05)
+            return min(1.0, max(0.0, (rms - self._noise_floor) / 3200.0))
         except Exception:
             return 0.0
 

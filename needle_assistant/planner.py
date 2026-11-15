@@ -68,6 +68,7 @@ _VERBS = {
     "switch", "focus", "minimize", "maximize", "restore", "lock", "shut",
     "restart", "sleep", "read", "copy", "paste", "save", "refresh", "reload",
     "scroll", "move", "rename", "delete", "create", "append", "list",
+    "send", "message", "text", "tell", "whatsapp",
 }
 
 

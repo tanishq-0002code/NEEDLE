@@ -58,7 +58,7 @@ class TelegramBotTests(unittest.TestCase):
         bot = FakeTelegramBot([123])
         bot.handle("open notepad")
         self.assertEqual(bot.typing, [123])
-        self.assertTrue(any("Opened Notepad" in text for _, text in bot.sent))
+        self.assertTrue(any("done" in text.lower() for _, text in bot.sent))
 
     def test_id_and_help_work_before_pairing(self) -> None:
         bot = FakeTelegramBot([])
@@ -89,7 +89,8 @@ class TelegramBotTests(unittest.TestCase):
 
         bot = FakeTelegramBot([123], handler=handler)
         bot.handle("open nope")
-        self.assertTrue(bot.sent[-1][1].startswith("Failed: "))
+        self.assertTrue("not done" in bot.sent[-1][1].lower())
+        self.assertIn("Could not find Nope", bot.sent[-1][1])
 
     def test_screenshot_is_sent_as_a_photo(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

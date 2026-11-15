@@ -89,10 +89,117 @@ class FastRouteTests(unittest.TestCase):
     def test_unknown_is_left_to_needle(self) -> None:
         self.assertIsNone(fast_route("what is the weather tomorrow"))
 
+    def test_whatsapp_message_with_text(self) -> None:
+        call = fast_route("send a whatsapp message to rahul saying I'll be late")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "send_message")
+        self.assertEqual(call.arguments["recipient"], "rahul")
+        self.assertEqual(call.arguments["text"], "I'll be late")
+
+    def test_whatsapp_colon_form(self) -> None:
+        call = fast_route("whatsapp rahul: on my way")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "send_message")
+        self.assertEqual(call.arguments["recipient"], "rahul")
+        self.assertEqual(call.arguments["text"], "on my way")
+
+    def test_tell_on_whatsapp(self) -> None:
+        call = fast_route("tell rahul on whatsapp I will be late")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "send_message")
+        self.assertEqual(call.arguments["recipient"], "rahul")
+        self.assertEqual(call.arguments["text"], "I will be late")
+
+    def test_send_this_message_uses_draft(self) -> None:
+        call = fast_route("send this message to rahul on whatsapp")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "send_message")
+        self.assertEqual(call.arguments["recipient"], "rahul")
+        self.assertEqual(call.arguments["text"], "")
+
+    def test_send_this_message_unknown_recipient_asks(self) -> None:
+        call = fast_route("send this message to someone on whatsapp")
+        self.assertIsNotNone(call)
+        self.assertIsNone(call.name)
+        self.assertIn("who", (call.error or "").lower())
+
+    def test_send_some_message_clarifies(self) -> None:
+        call = fast_route("send some message on whatsapp to someone")
+        self.assertIsNotNone(call)
+        self.assertIsNone(call.name)
+        self.assertEqual(call.source, "clarify")
+        self.assertIn("who", (call.error or "").lower())
+
+    def test_send_some_message_named(self) -> None:
+        call = fast_route("send some message on whatsapp to rahul saying on my way")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "send_message")
+        self.assertEqual(call.arguments["recipient"], "rahul")
+        self.assertEqual(call.arguments["text"], "on my way")
+
+    def test_clarify_call_carries_the_message(self) -> None:
+        call = fast_route("send a whatsapp message to someone saying hello")
+        self.assertIsNotNone(call)
+        self.assertIsNone(call.name)
+        self.assertEqual(call.source, "clarify")
+        self.assertEqual(call.arguments.get("text"), "hello")
+
+    def test_whatsapp_name_uses_draft(self) -> None:
+        call = fast_route("whatsapp rahul")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "send_message")
+        self.assertEqual(call.arguments["recipient"], "rahul")
+        self.assertEqual(call.arguments["text"], "")
+
+    def test_whatsapp_web_is_not_treated_as_recipient(self) -> None:
+        self.assertIsNone(fast_route("whatsapp web"))
+
+    def test_open_whatsapp_still_opens_web(self) -> None:
+        call = fast_route("open whatsapp")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "browser_control")
+        self.assertEqual(call.source, "fast")
+
+    def test_first_link_keeps_explicit_browser(self) -> None:
+        call = fast_route("open the first link in edge")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "browser_control")
+        self.assertEqual(call.arguments["action"], "click_first_result")
+        self.assertEqual(call.arguments["browser"], "edge")
+
+    def test_new_tab_search_routes_to_browser_navigation(self) -> None:
+        call = fast_route("open a new tab and search for tech burner")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "browser_control")
+        self.assertEqual(call.arguments["action"], "open_url")
+        self.assertIn("tech%20burner", call.arguments["url"])
+
+    def test_remember_contact(self) -> None:
+        call = fast_route("remember rahul as +91 98765 43210")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "memory")
+        self.assertEqual(call.arguments["action"], "set_contact")
+        self.assertEqual(call.arguments["alias"], "rahul")
+        self.assertEqual(call.arguments["target"], "+91 98765 43210")
+
+    def test_remember_draft(self) -> None:
+        call = fast_route("remember the message buy milk")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "memory")
+        self.assertEqual(call.arguments["action"], "set_preference")
+        self.assertEqual(call.arguments["key"], "draft")
+        self.assertEqual(call.arguments["value"], "buy milk")
+
+    def test_list_contacts(self) -> None:
+        call = fast_route("list contacts")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "memory")
+        self.assertEqual(call.arguments["action"], "list_contacts")
+
 
 class CatalogTests(unittest.TestCase):
     def test_tools_are_declared(self) -> None:
-        self.assertEqual(len(TOOL_SCHEMAS), 20)
+        self.assertEqual(len(TOOL_SCHEMAS), 21)
         self.assertEqual(
             ALLOWED_TOOLS,
             {
@@ -116,12 +223,35 @@ class CatalogTests(unittest.TestCase):
                 "schedule",
                 "macro",
                 "shortcut",
+                "send_message",
             },
         )
 
     def test_system_prompt_is_facts_not_instructions(self) -> None:
         self.assertIn("device:", SYSTEM_PROMPT)
         self.assertNotIn("You route", SYSTEM_PROMPT)
+
+    def test_send_message_validation(self) -> None:
+        name, arguments = validate_call(
+            "send_message", {"recipient": "rahul on whatsapp", "text": "hi"}
+        )
+        self.assertEqual(arguments["recipient"], "rahul")
+        self.assertEqual(arguments["text"], "hi")
+        with self.assertRaises(ValueError):
+            validate_call("send_message", {"recipient": "someone"})
+        with self.assertRaises(ValueError):
+            validate_call("send_message", {"recipient": ""})
+
+    def test_set_contact_validation(self) -> None:
+        name, arguments = validate_call(
+            "memory", {"action": "set_contact", "alias": "mom", "target": "+91 9812345678"}
+        )
+        self.assertEqual(name, "memory")
+        self.assertEqual(arguments["action"], "set_contact")
+        with self.assertRaises(ValueError):
+            validate_call("memory", {"action": "set_contact", "alias": "mom", "target": "not a number"})
+        with self.assertRaises(ValueError):
+            validate_call("memory", {"action": "set_contact", "alias": "", "target": "+91 9812345678"})
 
     def test_json_string_arguments_are_accepted(self) -> None:
         name, arguments = validate_call(

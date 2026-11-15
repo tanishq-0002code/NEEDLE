@@ -19,7 +19,7 @@ def load() -> dict[str, Any]:
             return data
     except (OSError, ValueError, TypeError):
         pass
-    return {"aliases": {}, "preferences": {}, "history": []}
+    return {"aliases": {}, "preferences": {}, "history": [], "contacts": {}}
 
 
 def save(data: dict[str, Any]) -> None:
@@ -72,6 +72,65 @@ def list_aliases() -> dict[str, str]:
     if not isinstance(aliases, dict):
         return {}
     return {str(k): str(v) for k, v in aliases.items()}
+
+
+def _norm_contact(name: str) -> str:
+    return " ".join(str(name or "").split()).lower()
+
+
+def get_contact(name: str) -> str | None:
+    data = load()
+    contacts = data.get("contacts", {})
+    if not isinstance(contacts, dict):
+        return None
+    key = _norm_contact(name)
+    if not key:
+        return None
+    value = contacts.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    # Unique partial match, e.g. "rahul" -> "rahul kumar". Ambiguous matches lose.
+    partials = [
+        v for k, v in contacts.items()
+        if isinstance(k, str) and isinstance(v, str) and v.strip()
+        and (key in k or k in key)
+    ]
+    if len(partials) == 1:
+        return partials[0].strip()
+    return None
+
+
+def set_contact(name: str, number: str) -> None:
+    data = load()
+    contacts = data.setdefault("contacts", {})
+    if not isinstance(contacts, dict):
+        contacts = {}
+        data["contacts"] = contacts
+    key = _norm_contact(name)
+    if key and number:
+        contacts[key] = str(number).strip()
+        save(data)
+
+
+def delete_contact(name: str) -> bool:
+    data = load()
+    contacts = data.get("contacts", {})
+    if not isinstance(contacts, dict):
+        return False
+    key = _norm_contact(name)
+    if key in contacts:
+        del contacts[key]
+        save(data)
+        return True
+    return False
+
+
+def list_contacts() -> dict[str, str]:
+    data = load()
+    contacts = data.get("contacts", {})
+    if not isinstance(contacts, dict):
+        return {}
+    return {str(k): str(v) for k, v in contacts.items()}
 
 
 def record_preference(key: str, value: Any) -> None:
