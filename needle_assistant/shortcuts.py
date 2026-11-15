@@ -14,39 +14,24 @@ def _path() -> Path:
 # Built-in shortcuts shipped with Needle Desktop. These work without the user
 # creating anything. User-created shortcuts (stored in shortcuts.json) are
 # checked first, so the user can override any of these.
+_STUDY_STEP = ["open edge and go to pw.live/study-v2/study"]
+
 _DEFAULT_SHORTCUTS: dict[str, list[str]] = {
-    "i am gonna study": [
-        "open edge",
-        "go to pw.live/study-v2/study",
-    ],
-    "i am going to study": [
-        "open edge",
-        "go to pw.live/study-v2/study",
-    ],
-    "time to study": [
-        "open edge",
-        "go to pw.live/study-v2/study",
-    ],
-    "study time": [
-        "open edge",
-        "go to pw.live/study-v2/study",
-    ],
-    "let's study": [
-        "open edge",
-        "go to pw.live/study-v2/study",
-    ],
-    "lets study": [
-        "open edge",
-        "go to pw.live/study-v2/study",
-    ],
-    "i am gonna study now": [
-        "open edge",
-        "go to pw.live/study-v2/study",
-    ],
-    "study mode": [
-        "open edge",
-        "go to pw.live/study-v2/study",
-    ],
+    "i am gonna study": list(_STUDY_STEP),
+    "i am going to study": list(_STUDY_STEP),
+    "time to study": list(_STUDY_STEP),
+    "study time": list(_STUDY_STEP),
+    "let's study": list(_STUDY_STEP),
+    "lets study": list(_STUDY_STEP),
+    "i am gonna study now": list(_STUDY_STEP),
+    "study mode": list(_STUDY_STEP),
+    "get the system ready for study": list(_STUDY_STEP),
+    "get system ready for study": list(_STUDY_STEP),
+    "get ready for study": list(_STUDY_STEP),
+    "prepare the system for study": list(_STUDY_STEP),
+    "ready for study": list(_STUDY_STEP),
+    "start study session": list(_STUDY_STEP),
+    "study session": list(_STUDY_STEP),
 }
 
 
