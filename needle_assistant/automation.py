@@ -10,9 +10,10 @@ import shutil
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import psutil
 
@@ -33,6 +34,14 @@ _PROTECTED_PROCESSES = {
     "wininit.exe", "system", "registry", "memory compression", "idle",
     "explorer.exe", "needledesktop.exe",
 }
+
+# Virtual-screen metrics so secondary monitors (including negative coordinates)
+# are captured and clicked correctly.
+_SM_XVIRTUALSCREEN = 76
+_SM_YVIRTUALSCREEN = 77
+_SM_CXVIRTUALSCREEN = 78
+_SM_CYVIRTUALSCREEN = 79
+_CLICK_RETRY_SECONDS = 3.0
 
 
 class AutomationError(RuntimeError):
@@ -406,6 +415,8 @@ class DesktopAutomation:
         self._last_plan_steps: list[str] = []
         self._last_browser_exe = ""
         self._last_browser_hwnd = 0
+        self._last_click: dict[str, Any] | None = None
+        self._last_grab_origin: tuple[int, int] = (0, 0)
 
     def _prepare_gui(self) -> None:
         if self._gui_ready:
@@ -448,6 +459,11 @@ class DesktopAutomation:
                     return self._window_manage(
                         str(call.arguments.get("title", "")),
                         str(call.arguments.get("action", "")),
+                        width=call.arguments.get("width"),
+                        height=call.arguments.get("height"),
+                        x=call.arguments.get("x"),
+                        y=call.arguments.get("y"),
+                        value=call.arguments.get("value"),
                     )
                 if call.name == "system_control":
                     return self._system_control(str(call.arguments.get("action", "")))
@@ -523,7 +539,16 @@ class DesktopAutomation:
                     )
                     self._restore(target_hwnd)
                     return self._click_element(
-                        str(call.arguments.get("target", "")), target_hwnd
+                        str(call.arguments.get("target", "")),
+                        target_hwnd,
+                        action=str(call.arguments.get("action", "") or ""),
+                        direction=str(call.arguments.get("direction", "") or ""),
+                        max_steps=self._int_arg(call.arguments.get("max_steps"), 8),
+                        button=str(call.arguments.get("button", "") or ""),
+                        clicks=self._int_arg(call.arguments.get("clicks"), 1),
+                        x=call.arguments.get("x"),
+                        y=call.arguments.get("y"),
+                        amount=self._int_arg(call.arguments.get("amount"), 5),
                     )
                 if call.name == "press_hotkey":
                     self._restore(restore_hwnd)
@@ -536,6 +561,56 @@ class DesktopAutomation:
                     return self._capture_camera()
                 if call.name == "control_media":
                     return self._control_media(str(call.arguments.get("action", "")))
+                if call.name == "audio_control":
+                    return self._audio_control(
+                        str(call.arguments.get("action", "")),
+                        call.arguments.get("value"),
+                    )
+                if call.name == "display_control":
+                    return self._display_control(
+                        str(call.arguments.get("action", "")),
+                        call.arguments.get("value"),
+                    )
+                if call.name == "connectivity_control":
+                    return self._connectivity_control(str(call.arguments.get("action", "")))
+                if call.name == "weather_report":
+                    return self._weather_report(str(call.arguments.get("city", "")))
+                if call.name == "notes":
+                    return self._notes(
+                        str(call.arguments.get("action", "")),
+                        str(call.arguments.get("title", "")),
+                        str(call.arguments.get("content", "")),
+                        str(call.arguments.get("query", "")),
+                    )
+                if call.name == "knowledge":
+                    return self._knowledge(
+                        str(call.arguments.get("action", "")),
+                        str(call.arguments.get("fact", "")),
+                        str(call.arguments.get("query", "")),
+                    )
+                if call.name == "file_search":
+                    return self._file_search(
+                        str(call.arguments.get("query", "")),
+                        str(call.arguments.get("path", "")),
+                    )
+                if call.name == "navigate_screen":
+                    return self._navigate_screen(str(call.arguments.get("action", "")))
+                if call.name == "email":
+                    return self._email(
+                        str(call.arguments.get("action", "")),
+                        str(call.arguments.get("to", "")),
+                        str(call.arguments.get("subject", "")),
+                        str(call.arguments.get("body", "")),
+                        str(call.arguments.get("cc", "")),
+                        call.arguments.get("max_results"),
+                        bool(call.arguments.get("unread_only", True)),
+                        str(call.arguments.get("query", "")),
+                    )
+                if call.name == "manage_browser_tabs":
+                    return self._manage_browser_tabs(
+                        str(call.arguments.get("action", "")),
+                        str(call.arguments.get("target", "")),
+                    )
                 return ExecutionResult(False, f"Unknown action: {call.name}", call.name)
             except AutomationError as exc:
                 return ExecutionResult(False, str(exc), call.name or "")
@@ -697,239 +772,704 @@ class DesktopAutomation:
         time.sleep(0.08)
         return ExecutionResult(True, "Pressed " + "+".join(normalized) + ".", "press_hotkey")
 
-    def _click_element(self, target: str, restore_hwnd: int) -> ExecutionResult:
+    @staticmethod
+    def _int_arg(value: object, default: int) -> int:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
+    def _click_element(
+        self,
+        target: str,
+        restore_hwnd: int,
+        action: str = "",
+        direction: str = "",
+        max_steps: int = 8,
+        button: str = "",
+        clicks: int = 1,
+        x: int | None = None,
+        y: int | None = None,
+        amount: int = 5,
+    ) -> ExecutionResult:
         self._prepare_gui()
         self._failsafe()
         import pyautogui
 
         raw = (target or "").strip()
         lower = raw.lower()
-
-        # 1. Cursor movement without clicking
-        move_match = re.search(r"^(?:move\s+(?:the\s+)?(?:cursor|mouse)\s+(?:to\s+)?|hover\s+(?:over\s+)?)(.+)$", lower)
-        if move_match:
-            sub = move_match.group(1).strip()
-            coord = re.search(r"(-?\d{1,5})\s*[, ]\s*(-?\d{1,5})", sub)
-            if coord:
-                x, y = int(coord.group(1)), int(coord.group(2))
-                self._check_point(x, y)
-                pyautogui.moveTo(x, y, duration=0.2)
-                return ExecutionResult(True, f"Moved cursor to {x}, {y}.", "click_element")
-            screen = self._screen_size()
-            aliases = self._screen_aliases(screen)
-            if sub in aliases:
-                x, y = aliases[sub]
-                pyautogui.moveTo(x, y, duration=0.2)
-                return ExecutionResult(True, f"Moved cursor to {sub}.", "click_element")
-
-        # 2. Scrolling
-        scroll_match = re.search(r"\bscroll\s+(up|down)(?:\s+(\d+))?\b", lower)
-        if scroll_match:
-            direction = scroll_match.group(1).lower()
-            amount = int(scroll_match.group(2)) if scroll_match.group(2) else 5
-            clicks = amount * 120 if direction == "up" else -amount * 120
-            pyautogui.scroll(clicks)
-            return ExecutionResult(True, f"Scrolled {direction} {amount} units.", "click_element")
-
-        # 3. Mouse button variants (right click, double click, middle click)
-        btn = "left"
-        clicks_count = 1
-        sub_target = raw
-        if re.search(r"\bright[\s-]click\b", lower):
+        act = re.sub(r"[\s-]+", "_", (action or "").strip().lower())
+        btn = (button or "").strip().lower()
+        if btn not in {"left", "right", "middle"}:
+            btn = ""
+        count = self._int_arg(clicks, 1)
+        if count < 1:
+            count = 1
+        count = min(count, 3)
+        if act == "double_click":
+            count = 2
+            btn = btn or "left"
+        elif act == "right_click":
             btn = "right"
-            sub_target = re.sub(r"(?i)\b(?:please\s+)?(?:do\s+a\s+)?right[\s-]click(?:\s+(?:on|at))?\s*", "", raw).strip()
-        elif re.search(r"\bdouble[\s-]click\b", lower):
+        elif act == "click_again" and not btn:
             btn = "left"
-            clicks_count = 2
-            sub_target = re.sub(r"(?i)\b(?:please\s+)?(?:do\s+a\s+)?double[\s-]click(?:\s+(?:on|at))?\s*", "", raw).strip()
-        elif re.search(r"\bmiddle[\s-]click\b", lower):
-            btn = "middle"
-            sub_target = re.sub(r"(?i)\b(?:please\s+)?(?:do\s+a\s+)?middle[\s-]click(?:\s+(?:on|at))?\s*", "", raw).strip()
-        else:
-            sub_target = re.sub(r"(?i)\b(?:please\s+)?(?:click|tap)(?:\s+(?:on|at))?\s*", "", raw).strip()
+        elif not btn:
+            btn = "left"
 
-        # If sub_target is empty, click at the current mouse cursor location
-        if not sub_target or sub_target.lower() in {"here", "this", "it"}:
-            pos = pyautogui.position()
-            pyautogui.click(pos.x, pos.y, clicks=clicks_count, button=btn)
-            action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
-            return ExecutionResult(True, f"{action_desc} at current position ({pos.x}, {pos.y}).", "click_element")
+        # 1. Explicit coordinates take priority.
+        if x is not None and y is not None:
+            try:
+                px, py = int(x), int(y)
+            except (TypeError, ValueError):
+                raise AutomationError("The click coordinates are invalid.")
+            self._check_point(px, py)
+            pyautogui.moveTo(px, py, duration=0.12)
+            pyautogui.click(px, py, clicks=count, button=btn)
+            self._remember_click(raw or f"{px}, {py}", px, py, btn, count, restore_hwnd)
+            return ExecutionResult(True, f"Clicked at {px}, {py}.", "click_element")
 
+        # 2. Replay the previous successful target.
+        if act == "click_again":
+            return self._click_last_target(button=btn, clicks=count)
+
+        # 3. Accept legacy free-text targets like "right click Save" or
+        #    "move cursor to center" when the model does not fill in action.
+        if act in {"", "click"}:
+            match = re.match(r"^(?:please\s+)?right[\s-]click\b", lower)
+            if match:
+                act, btn = "right_click", "right"
+                raw = re.sub(
+                    r"(?i)^(?:please\s+)?right[\s-]click(?:\s+(?:on|at))?\s*", "", raw
+                ).strip()
+            else:
+                match = re.match(r"^(?:please\s+)?double[\s-]click\b", lower)
+                if match:
+                    act, count = "double_click", 2
+                    raw = re.sub(
+                        r"(?i)^(?:please\s+)?double[\s-]click(?:\s+(?:on|at))?\s*", "", raw
+                    ).strip()
+                else:
+                    match = re.match(r"^(?:please\s+)?middle[\s-]click\b", lower)
+                    if match:
+                        btn = "middle"
+                        raw = re.sub(
+                            r"(?i)^(?:please\s+)?middle[\s-]click(?:\s+(?:on|at))?\s*", "", raw
+                        ).strip()
+                    else:
+                        match = re.match(
+                            r"^(?:please\s+)?(?:move\s+(?:the\s+)?(?:cursor|mouse)|hover\b)",
+                            lower,
+                        )
+                        if match:
+                            act = "move"
+                            raw = re.sub(
+                                r"(?i)^(?:please\s+)?(?:move\s+(?:the\s+)?(?:cursor|mouse)"
+                                r"\s*(?:to\s+)?|hover\s+(?:over\s+)?)",
+                                "",
+                                raw,
+                            ).strip()
+                        else:
+                            match = re.match(
+                                r"^(?:please\s+)?scroll\s+(up|down)(?:\s+(\d+))?\s*$",
+                                lower,
+                            )
+                            if match:
+                                act = f"scroll_{match.group(1).lower()}"
+                                amount = int(match.group(2) or amount)
+                                raw = ""
+                            else:
+                                raw = re.sub(
+                                    r"(?i)^(?:please\s+)?(?:click|tap)(?:\s+(?:on|at))?\s*",
+                                    "",
+                                    raw,
+                                ).strip()
+
+        # 4. Plain scrolling.
+        if act in {"scroll_up", "scroll_down"}:
+            steps = max(1, min(50, self._int_arg(amount, 5)))
+            wheel = steps * 120
+            if act == "scroll_up":
+                wheel = -wheel
+            anchor_x, anchor_y = self._focus_anchor_point(restore_hwnd)
+            pyautogui.moveTo(anchor_x, anchor_y, duration=0.1)
+            pyautogui.scroll(wheel)
+            label = "up" if act == "scroll_up" else "down"
+            return ExecutionResult(
+                True, f"Scrolled {label} {steps} steps.", "click_element"
+            )
+
+        # 5. Scroll until the element becomes visible, then click it.
+        if act == "scroll_to":
+            if not raw:
+                raise AutomationError("Tell me which element to scroll to.")
+            return self._scroll_to_element(
+                raw,
+                restore_hwnd,
+                direction=direction or "down",
+                max_steps=max_steps,
+                button=btn,
+                clicks=count,
+            )
+
+        # 6. Explicit coordinates embedded in the target text.
         coordinate = re.fullmatch(
-            r"\s*(?:at\s+|coordinates?\s+)?(-?\d{1,5})\s*[, ]\s*(-?\d{1,5})\s*",
-            sub_target,
+            r"\s*(?:at\s+|coordinates?\s+)?(-?\d{1,6})\s*[, ]\s*(-?\d{1,6})\s*",
+            raw,
             flags=re.I,
         )
         if coordinate:
-            x, y = int(coordinate.group(1)), int(coordinate.group(2))
-            self._check_point(x, y)
-            pyautogui.moveTo(x, y, duration=0.12)
-            pyautogui.click(x, y, clicks=clicks_count, button=btn)
-            action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
-            return ExecutionResult(True, f"{action_desc} at {x}, {y}.", "click_element")
+            px, py = int(coordinate.group(1)), int(coordinate.group(2))
+            self._check_point(px, py)
+            pyautogui.moveTo(px, py, duration=0.12)
+            if act != "move":
+                pyautogui.click(px, py, clicks=count, button=btn)
+                self._remember_click(raw, px, py, btn, count, restore_hwnd)
+                prefix = self._click_verb(btn, count)
+                return ExecutionResult(True, f"{prefix} at {px}, {py}.", "click_element")
+            return ExecutionResult(True, f"Moved cursor to {px}, {py}.", "click_element")
 
-        screen = self._screen_size()
-        semantic = sub_target.lower().strip().strip(".")
-        aliases = self._screen_aliases(screen)
+        # 7. Screen aliases (center, top left, ...).
+        semantic = raw.lower().strip().strip(".")
+        aliases = self._screen_aliases()
         if semantic in aliases:
-            x, y = aliases[semantic]
-            pyautogui.moveTo(x, y, duration=0.12)
-            pyautogui.click(x, y, clicks=clicks_count, button=btn)
-            action_desc = "Right-clicked" if btn == "right" else ("Double-clicked" if clicks_count == 2 else "Clicked")
-            return ExecutionResult(True, f"{action_desc} the {semantic} of the screen.", "click_element")
+            px, py = aliases[semantic]
+            pyautogui.moveTo(px, py, duration=0.2 if act == "move" else 0.12)
+            if act == "move":
+                return ExecutionResult(True, f"Moved cursor to {semantic}.", "click_element")
+            pyautogui.click(px, py, clicks=count, button=btn)
+            self._remember_click(raw, px, py, btn, count, restore_hwnd)
+            return ExecutionResult(
+                True, f"{self._click_verb(btn, count)} the {semantic} of the screen.",
+                "click_element",
+            )
 
-        try:
-            self._click_uia(sub_target, restore_hwnd, button=btn, clicks=clicks_count)
-            return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
-        except AutomationError:
-            # Fallback: line-aware phrase matching over OCR words.
-            try:
-                from .vision import ocr_words
-                import pyautogui
+        # 8. Empty/"it" target: click where the cursor already is.
+        if not raw or semantic in {"here", "this", "it"}:
+            pos = pyautogui.position()
+            if act == "move":
+                return ExecutionResult(
+                    True, f"The cursor is already at {pos.x}, {pos.y}.", "click_element"
+                )
+            pyautogui.click(pos.x, pos.y, clicks=count, button=btn)
+            self._remember_click(raw or "current position", pos.x, pos.y, btn, count, restore_hwnd)
+            return ExecutionResult(
+                True,
+                f"{self._click_verb(btn, count)} at the current position ({pos.x}, {pos.y}).",
+                "click_element",
+            )
 
-                words = ocr_words(self._grab_screen_image())
-
-                def _norm(word: str) -> str:
-                    return re.sub(r"[^a-z0-9]+", " ", (word or "").lower()).strip()
-
-                # Build line objects by clustering words whose y-centers are close.
-                items: list[dict] = []
-                for word in words:
-                    text = _norm(str(word.get("text", "")))
-                    if not text:
-                        continue
-                    try:
-                        x = float(word.get("x", 0))
-                        y = float(word.get("y", 0))
-                        w = float(word.get("width", 0))
-                        h = float(word.get("height", 0))
-                    except Exception:
-                        continue
-                    items.append({"text": text, "x": x, "y": y, "w": w, "h": h, "yc": y + h / 2})
-
-                items.sort(key=lambda item: (item["yc"], item["x"]))
-                heights = sorted(item["h"] for item in items) or [12.0]
-                line_tolerance = max(10.0, heights[len(heights) // 2] * 1.8)
-
-                lines: list[list[dict]] = []
-                current: list[dict] = []
-                for item in items:
-                    if current and abs(item["yc"] - current[-1]["yc"]) > line_tolerance:
-                        lines.append(current)
-                        current = []
-                    current.append(item)
-                if current:
-                    lines.append(current)
-                for line in lines:
-                    line.sort(key=lambda item: item["x"])
-
-                target = _norm(sub_target)
-                target = re.sub(r"\s+", " ", target).strip()
-
-                # Exact line match: target is substring of a line.
-                best_rect: dict | None = None
-                for line in lines:
-                    line_text = " ".join(item["text"] for item in line)
-                    idx = line_text.find(target)
-                    if idx == -1:
-                        continue
-                    cursor = idx
-                    matched: list[dict] = []
-                    for i, item in enumerate(line):
-                        word_text = item["text"]
-                        start = cursor
-                        end = cursor + len(word_text)
-                        if end <= idx + len(target) and end >= idx:
-                            matched.append(item)
-                        cursor += len(word_text) + 1
-                    if len(matched) != len(target.split()):
-                        continue
-                    x0 = min(item["x"] for item in matched)
-                    y0 = min(item["y"] for item in matched)
-                    x1 = max(item["x"] + item["w"] for item in matched)
-                    y1 = max(item["y"] + item["h"] for item in matched)
-                    best_rect = {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
-                    break
-
-                if best_rect is not None:
-                    x = int(best_rect["x"] + best_rect["w"] // 2)
-                    y = int(best_rect["y"] + best_rect["h"] // 2)
-                    pyautogui.moveTo(x, y, duration=0.12)
-                    pyautogui.click(x, y, clicks=clicks_count, button=btn)
-                    return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
-
-                # 2) Fallback: nearest matching line (partially tokenized).
-                target_tokens = target.split()
-                if target_tokens:
-                    from difflib import SequenceMatcher
-
-                    def _token_present(token: str, line_words: list[str]) -> bool:
-                        t = token.lower()
-                        for w in line_words:
-                            wl = w.lower()
-                            if t == wl:
-                                return True
-                            if t in wl or wl in t:
-                                return True
-                            if len(t) >= 4 and len(wl) >= 4:
-                                if SequenceMatcher(None, t, wl).ratio() > 0.75:
-                                    return True
-                        return False
-
-                    best_line = None
-                    best_score = -1.0
-                    for line in lines:
-                        line_words = [item["text"] for item in line]
-                        if not line_words:
-                            continue
-                        matched = sum(1 for token in target_tokens if _token_present(token, line_words))
-                        score = matched / len(target_tokens)
-                        if score > best_score:
-                            best_score = score
-                            best_line = (line, matched, len(target_tokens))
-                    if best_line and best_score >= 0.5:
-                        line, matched, total = best_line
-                        x0 = min(item["x"] for item in line)
-                        y0 = min(item["y"] for item in line)
-                        x1 = max(item["x"] + item["w"] for item in line)
-                        y1 = max(item["y"] + item["h"] for item in line)
-                        x = int(x0 + (x1 - x0) // 2)
-                        y = int(y0 + (y1 - y0) // 2)
-                        pyautogui.moveTo(x, y, duration=0.12)
-                        pyautogui.click(x, y, clicks=clicks_count, button=btn)
-                        return ExecutionResult(True, f"Clicked {sub_target}.", "click_element")
-
-                raise AutomationError(f"I couldn't find '{sub_target}' on the screen.")
-            except Exception as exc:
-                raise AutomationError(f"I couldn't find '{sub_target}' on the screen.") from exc
+        # 9. Locate by UI Automation, then OCR, with a short retry window so
+        #    windows and menus that are still rendering get a chance to appear.
+        px, py, how = self._locate_target(
+            raw, restore_hwnd, button=btn, clicks=count, move_only=(act == "move")
+        )
+        if act == "move":
+            return ExecutionResult(True, f"Moved cursor to {raw} ({how}).", "click_element")
+        where = f" at {px}, {py}" if px is not None else ""
+        return ExecutionResult(
+            True, f"{self._click_verb(btn, count)} {raw}{where} ({how}).", "click_element"
+        )
 
     @staticmethod
-    def _screen_aliases(screen: tuple[int, int]) -> dict[str, tuple[int, int]]:
-        w, h = screen
+    def _click_verb(button: str, clicks: int) -> str:
+        if button == "right":
+            return "Right-clicked"
+        if button == "middle":
+            return "Middle-clicked"
+        return "Double-clicked" if clicks == 2 else "Clicked"
+
+    def _remember_click(
+        self, target: str, x: int, y: int, button: str, clicks: int, hwnd: int
+    ) -> None:
+        self._last_click = {
+            "target": target or "",
+            "x": int(x),
+            "y": int(y),
+            "button": button or "left",
+            "clicks": max(1, min(3, int(clicks or 1))),
+            "hwnd": int(hwnd or 0),
+            "at": time.time(),
+        }
+
+    def _click_last_target(self, button: str = "", clicks: int = 0) -> ExecutionResult:
+        import pyautogui
+
+        last = self._last_click
+        if not last:
+            raise AutomationError(
+                "I don't have a previous target yet. Tell me what to click first."
+            )
+        target = str(last.get("target") or "")
+        btn = button or str(last.get("button") or "left")
+        count = max(1, min(3, self._int_arg(clicks or last.get("clicks"), 1)))
+        hwnd = self._int_arg(last.get("hwnd"), 0)
+        px = self._int_arg(last.get("x"), 0)
+        py = self._int_arg(last.get("y"), 0)
+        fg = win.get_foreground_window()
+        same_app = True
+        if hwnd and fg:
+            try:
+                same_app = win.get_window_pid(fg) == win.get_window_pid(hwnd)
+            except Exception:
+                same_app = fg == hwnd
+        if same_app and self._point_on_screen(px, py):
+            pyautogui.moveTo(px, py, duration=0.12)
+            pyautogui.click(px, py, clicks=count, button=btn)
+            self._remember_click(target, px, py, btn, count, hwnd or fg)
+            label = target or "the last element"
+            return ExecutionResult(
+                True, f"Clicked {label} again at {px}, {py}.", "click_element"
+            )
+        if not target:
+            raise AutomationError(
+                "The previous target is no longer on screen. Tell me what to click."
+            )
+        nx, ny, how = self._locate_target(
+            target, hwnd or fg, button=btn, clicks=count
+        )
+        where = f" at {nx}, {ny}" if nx is not None else ""
+        return ExecutionResult(
+            True, f"{self._click_verb(btn, count)} {target} again{where} ({how}).",
+            "click_element",
+        )
+
+    def _scroll_to_element(
+        self,
+        target: str,
+        hwnd: int,
+        direction: str = "down",
+        max_steps: int = 8,
+        button: str = "left",
+        clicks: int = 1,
+    ) -> ExecutionResult:
+        import pyautogui
+
+        direction = "up" if str(direction or "").lower().startswith("up") else "down"
+        try:
+            steps = max(1, min(15, int(max_steps or 8)))
+        except (TypeError, ValueError):
+            steps = 8
+        count = max(1, min(3, int(clicks or 1)))
+        anchor_x, anchor_y = self._focus_anchor_point(hwnd)
+        for attempt in range(steps + 1):
+            located = self._ocr_locate(target, hwnd)
+            if located is None:
+                point = None
+                try:
+                    point = self._uia_point(target, hwnd)
+                except AutomationError:
+                    point = None
+                if point is not None:
+                    located = (point[0], point[1], "uia")
+            if located is not None:
+                px, py, how = located
+                pyautogui.moveTo(px, py, duration=0.12)
+                pyautogui.click(px, py, clicks=count, button=button)
+                self._remember_click(target, px, py, button, count, hwnd)
+                return ExecutionResult(
+                    True,
+                    f"Found and clicked {target} at {px}, {py} after scrolling ({how}).",
+                    "click_element",
+                )
+            if attempt >= steps:
+                break
+            pyautogui.moveTo(anchor_x, anchor_y, duration=0.08)
+            pyautogui.scroll(-360 if direction == "down" else 360)
+            time.sleep(0.35)
+        raise AutomationError(f"I couldn't find '{target}' after scrolling {direction}.")
+
+    def _focus_anchor_point(self, hwnd: int) -> tuple[int, int]:
+        if hwnd and win.is_window(hwnd):
+            try:
+                left, top, right, bottom = win.get_window_rect(hwnd)
+                if right - left >= 80 and bottom - top >= 80:
+                    return (left + right) // 2, (top + bottom) // 2
+            except Exception:
+                pass
+        origin_x, origin_y, width, height = self._virtual_screen_rect()
+        return origin_x + width // 2, origin_y + height // 2
+
+    def _locate_target(
+        self,
+        target: str,
+        hwnd: int,
+        button: str = "left",
+        clicks: int = 1,
+        move_only: bool = False,
+    ) -> tuple[int | None, int | None, str]:
+        """Find a target with a short retry window, UIA first then OCR."""
+        import pyautogui
+
+        deadline = time.monotonic() + _CLICK_RETRY_SECONDS
+        last_error = ""
+        uia_unavailable = False
+        while True:
+            if not uia_unavailable:
+                try:
+                    if move_only:
+                        point = self._uia_point(target, hwnd)
+                        if point is not None:
+                            pyautogui.moveTo(point[0], point[1], duration=0.2)
+                            return point[0], point[1], "uia"
+                    else:
+                        found, px, py = self._uia_click(
+                            target, hwnd, button=button, clicks=clicks
+                        )
+                        if found:
+                            if px is not None and py is not None:
+                                self._remember_click(target, px, py, button, clicks, hwnd)
+                            return px, py, "uia"
+                except AutomationError as exc:
+                    last_error = str(exc)
+                    if "unavailable" in last_error.lower():
+                        uia_unavailable = True
+            located = self._ocr_locate(target, hwnd)
+            if located is not None:
+                px, py, how = located
+                pyautogui.moveTo(px, py, duration=0.12)
+                if move_only:
+                    return px, py, how
+                pyautogui.click(px, py, clicks=clicks, button=button)
+                self._remember_click(target, px, py, button, clicks, hwnd)
+                return px, py, how
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+        detail = f" ({last_error})" if last_error else ""
+        raise AutomationError(f"I couldn't find '{target}' on the screen{detail}.")
+
+    @contextmanager
+    def _uia_session(self):
+        try:
+            import comtypes
+            import uiautomation as auto
+        except Exception as exc:
+            raise AutomationError("UI element search is unavailable on this system.") from exc
+        comtypes.CoInitialize()
+        try:
+            auto.SetGlobalSearchTimeout(1.0)
+            yield auto
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    def _uia_candidate_handles(self, hwnd: int) -> list[int]:
+        """Target window plus its popups/siblings and the active browser."""
+        handles: list[int] = []
+
+        def add(value: int) -> None:
+            if value and value not in handles:
+                handles.append(int(value))
+
+        add(hwnd)
+        try:
+            add(win.get_foreground_window())
+        except Exception:
+            pass
+        try:
+            _exe, browser_hwnd = self._active_browser()
+            add(browser_hwnd)
+        except Exception:
+            pass
+        if hwnd:
+            try:
+                pid = win.get_window_pid(hwnd)
+                siblings: list[tuple[int, int]] = []
+                for candidate in win.visible_windows_for_pid(pid):
+                    if candidate in handles:
+                        continue
+                    left, top, right, bottom = win.get_window_rect(candidate)
+                    area = max(0, right - left) * max(0, bottom - top)
+                    siblings.append((area, candidate))
+                # Small popups/menus/dialogs first, capped for responsiveness.
+                for _area, candidate in sorted(siblings)[:6]:
+                    add(candidate)
+            except Exception:
+                pass
+        return handles
+
+    def _find_uia_in_windows(self, auto, target: str, hwnd: int):
+        for candidate_hwnd in self._uia_candidate_handles(hwnd):
+            try:
+                root = auto.ControlFromHandle(candidate_hwnd)
+            except Exception:
+                root = None
+            if root is None:
+                continue
+            is_browser = self._process_name_for_hwnd(candidate_hwnd) in self._BROWSER_PROCESSES
+            found = self._find_uia_control(root, target, interactive_only=is_browser)
+            if found is not None:
+                return found
+        return None
+
+    def _uia_click(
+        self, target: str, hwnd: int, button: str = "left", clicks: int = 1
+    ) -> tuple[bool, int | None, int | None]:
+        with self._uia_session() as auto:
+            control = self._find_uia_in_windows(auto, target, hwnd)
+            if control is None:
+                return False, None, None
+            point = self._uia_clickable_point(control)
+            self._activate_uia_control_for(control, button=button, clicks=clicks)
+            return True, (point[0] if point else None), (point[1] if point else None)
+
+    def _uia_point(self, target: str, hwnd: int) -> tuple[int, int] | None:
+        with self._uia_session() as auto:
+            control = self._find_uia_in_windows(auto, target, hwnd)
+            if control is None:
+                return None
+            return self._uia_clickable_point(control)
+
+    @staticmethod
+    def _uia_clickable_point(control) -> tuple[int, int] | None:
+        try:
+            point = control.GetClickablePoint()
+            return int(point.x), int(point.y)
+        except Exception:
+            return None
+
+    def _activate_uia_control_for(
+        self, control, button: str = "left", clicks: int = 1
+    ) -> None:
+        try:
+            control.SetFocus()
+        except Exception:
+            pass
+        if button == "left" and clicks == 1 and self._activate_uia_control(control):
+            time.sleep(0.08)
+            return
+        point = self._uia_clickable_point(control)
+        if point is None:
+            raise AutomationError(
+                "I found the control but couldn't determine where to click it."
+            )
+        self._mouse_click(point[0], point[1], button=button, clicks=clicks)
+        time.sleep(0.08)
+
+    def _ocr_locate(self, target: str, hwnd: int = 0) -> tuple[int, int, str] | None:
+        try:
+            from .vision import ocr_words
+        except Exception:
+            return None
+        image, origin_x, origin_y = self._grab_screen_with_origin()
+        crop = image
+        crop_x = crop_y = 0
+        title_bar_y: int | None = None
+        window_center: tuple[int, int] | None = None
+        if hwnd and win.is_window(hwnd):
+            try:
+                left, top, right, bottom = win.get_window_rect(hwnd)
+                if right - left >= 140 and bottom - top >= 100:
+                    c_left = max(0, left - origin_x)
+                    c_top = max(0, top - origin_y)
+                    c_right = min(image.width, right - origin_x)
+                    c_bottom = min(image.height, bottom - origin_y)
+                    if c_right - c_left >= 100 and c_bottom - c_top >= 80:
+                        crop = image.crop((c_left, c_top, c_right, c_bottom))
+                        crop_x, crop_y = c_left, c_top
+                        title_bar_y = max(0, (top - origin_y) - crop_y + 34)
+                        window_center = (crop.width // 2, crop.height // 2)
+            except Exception:
+                crop = image
+                crop_x = crop_y = 0
+                title_bar_y = None
+                window_center = None
+        try:
+            words = ocr_words(crop)
+        except Exception:
+            return None
+        found = self._best_ocr_match(
+            target, words, title_bar_y=title_bar_y, window_center=window_center
+        )
+        if found is None:
+            return None
+        rel_x, rel_y, label, score = found
+        return (
+            origin_x + crop_x + rel_x,
+            origin_y + crop_y + rel_y,
+            f"ocr:{label} {score:.2f}",
+        )
+
+    @classmethod
+    def _cluster_ocr_lines(
+        cls, items: list[dict[str, Any]]
+    ) -> list[list[dict[str, Any]]]:
+        if not items:
+            return []
+        ordered = sorted(items, key=lambda item: (item["yc"], item["x"]))
+        heights = sorted(item["h"] for item in ordered) or [12.0]
+        tolerance = max(8.0, heights[len(heights) // 2] * 1.6)
+        lines: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for item in ordered:
+            if current and abs(item["yc"] - current[-1]["yc"]) > tolerance:
+                lines.append(current)
+                current = []
+            current.append(item)
+        if current:
+            lines.append(current)
+        for line in lines:
+            line.sort(key=lambda item: item["x"])
+        return lines
+
+    @classmethod
+    def _best_ocr_match(
+        cls,
+        target: str,
+        words: list[dict[str, Any]],
+        title_bar_y: int | None = None,
+        window_center: tuple[int, int] | None = None,
+    ) -> tuple[int, int, str, float] | None:
+        """Line-aware, ranked OCR match returning the best click point."""
+        normalized_target = _norm(target)
+        tokens = [token for token in normalized_target.split() if token]
+        if not tokens:
+            return None
+        items: list[dict[str, Any]] = []
+        for word in words:
+            text = _norm(str(word.get("text", "")))
+            if not text:
+                continue
+            try:
+                left = float(word.get("x", 0))
+                top = float(word.get("y", 0))
+                width = float(word.get("width", 0))
+                height = float(word.get("height", 0))
+            except (TypeError, ValueError):
+                continue
+            if width <= 0 or height <= 0:
+                continue
+            items.append(
+                {
+                    "text": text,
+                    "x": left,
+                    "y": top,
+                    "w": width,
+                    "h": height,
+                    "xc": left + width / 2,
+                    "yc": top + height / 2,
+                }
+            )
+        if not items:
+            return None
+        max_distance = 1.0
+        if window_center is not None:
+            max_distance = max(
+                1.0,
+                abs(window_center[0]) + abs(window_center[1]) + 1.0,
+            )
+        best: tuple[float, int, int, str] | None = None
+        for line in cls._cluster_ocr_lines(items):
+            line_words = [item["text"] for item in line]
+            line_text = " ".join(line_words).strip()
+            if not line_text:
+                continue
+            score = 0.0
+            if normalized_target == line_text:
+                score = 1.0
+            elif normalized_target in line_text:
+                coverage = len(normalized_target) / max(1, len(line_text))
+                score = 0.70 + 0.30 * min(1.0, coverage * 2.0)
+            else:
+                present = 0
+                for token in tokens:
+                    if token in line_words:
+                        present += 1
+                        continue
+                    if len(token) >= 4 and any(
+                        len(candidate) >= 4
+                        and difflib.SequenceMatcher(None, token, candidate).ratio() >= 0.8
+                        for candidate in line_words
+                    ):
+                        present += 1
+                if present == len(tokens):
+                    score = 0.82
+                elif present:
+                    score = 0.45 + 0.30 * (present / len(tokens))
+                else:
+                    ratio = difflib.SequenceMatcher(
+                        None, normalized_target, line_text
+                    ).ratio()
+                    if ratio >= 0.72:
+                        score = ratio * 0.70
+                if len(tokens) == 1:
+                    for item in line:
+                        if item["text"] == tokens[0]:
+                            score = max(score, 0.95)
+                            break
+            if score <= 0:
+                continue
+            left = min(item["x"] for item in line)
+            top = min(item["y"] for item in line)
+            right = max(item["x"] + item["w"] for item in line)
+            bottom = max(item["y"] + item["h"] for item in line)
+            width, height = right - left, bottom - top
+            center_x = int((left + right) / 2)
+            center_y = int((top + bottom) / 2)
+            # Paragraph-like or tiny OCR boxes are unlikely to be controls.
+            if width > 700 or height > 90:
+                score *= 0.82
+            if height < 8:
+                score *= 0.90
+            # Never prefer the window title bar when a real control also matches.
+            if title_bar_y is not None and center_y < title_bar_y:
+                score *= 0.70
+            if window_center is not None:
+                distance = abs(center_x - window_center[0]) + abs(center_y - window_center[1])
+                score += 0.03 * (1.0 - min(1.0, distance / max_distance))
+            if best is None or score > best[0]:
+                best = (score, center_x, center_y, line_text[:60])
+        if best is None or best[0] < 0.55:
+            return None
+        return best[1], best[2], best[3], best[0]
+
+    def _virtual_screen_rect(self) -> tuple[int, int, int, int]:
+        """Return (x, y, width, height) covering every monitor."""
+        try:
+            x = int(user32.GetSystemMetrics(_SM_XVIRTUALSCREEN))
+            y = int(user32.GetSystemMetrics(_SM_YVIRTUALSCREEN))
+            width = int(user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN))
+            height = int(user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN))
+        except Exception:
+            x = y = 0
+            width = height = 0
+        if width <= 0 or height <= 0:
+            width, height = self._screen_size()
+            x = y = 0
+        return x, y, width, height
+
+    def _screen_aliases(self) -> dict[str, tuple[int, int]]:
+        origin_x, origin_y, width, height = self._virtual_screen_rect()
+
+        def point(fx: float, fy: float) -> tuple[int, int]:
+            return origin_x + int(width * fx), origin_y + int(height * fy)
+
         return {
-            "center": (w // 2, h // 2),
-            "centre": (w // 2, h // 2),
-            "middle": (w // 2, h // 2),
-            "top left": (w // 6, h // 6),
-            "top-left": (w // 6, h // 6),
-            "top right": (w * 5 // 6, h // 6),
-            "top-right": (w * 5 // 6, h // 6),
-            "upper-left": (w // 6, h // 6),
-            "upper-right": (w * 5 // 6, h // 6),
-            "bottom left": (w // 6, h * 5 // 6),
-            "bottom-left": (w // 6, h * 5 // 6),
-            "bottom right": (w * 5 // 6, h * 5 // 6),
-            "bottom-right": (w * 5 // 6, h * 5 // 6),
-            "lower-left": (w // 6, h * 5 // 6),
-            "lower-right": (w * 5 // 6, h * 5 // 6),
-            "top center": (w // 2, h // 6),
-            "bottom center": (w // 2, h * 5 // 6),
-            "left center": (w // 6, h // 2),
-            "right center": (w * 5 // 6, h // 2),
-            "left side": (w // 6, h // 2),
-            "right side": (w * 5 // 6, h // 2),
-            "top": (w // 2, h // 6),
-            "bottom": (w // 2, h * 5 // 6),
+            "center": point(0.5, 0.5),
+            "centre": point(0.5, 0.5),
+            "middle": point(0.5, 0.5),
+            "top left": point(1 / 6, 1 / 6),
+            "top-left": point(1 / 6, 1 / 6),
+            "top right": point(5 / 6, 1 / 6),
+            "top-right": point(5 / 6, 1 / 6),
+            "upper-left": point(1 / 6, 1 / 6),
+            "upper-right": point(5 / 6, 1 / 6),
+            "bottom left": point(1 / 6, 5 / 6),
+            "bottom-left": point(1 / 6, 5 / 6),
+            "bottom right": point(5 / 6, 5 / 6),
+            "bottom-right": point(5 / 6, 5 / 6),
+            "lower-left": point(1 / 6, 5 / 6),
+            "lower-right": point(5 / 6, 5 / 6),
+            "top center": point(0.5, 1 / 6),
+            "bottom center": point(0.5, 5 / 6),
+            "left center": point(1 / 6, 0.5),
+            "right center": point(5 / 6, 0.5),
+            "left side": point(1 / 6, 0.5),
+            "right side": point(5 / 6, 0.5),
+            "top": point(0.5, 1 / 6),
+            "bottom": point(0.5, 5 / 6),
         }
 
     @staticmethod
@@ -942,9 +1482,15 @@ class DesktopAutomation:
         except Exception:
             return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
 
+    def _point_on_screen(self, x: int, y: int) -> bool:
+        origin_x, origin_y, width, height = self._virtual_screen_rect()
+        return (
+            origin_x <= x < origin_x + width
+            and origin_y <= y < origin_y + height
+        )
+
     def _check_point(self, x: int, y: int) -> None:
-        width, height = self._screen_size()
-        if not (0 <= x < width and 0 <= y < height):
+        if not self._point_on_screen(x, y):
             raise AutomationError(f"The point {x}, {y} is outside the screen.")
 
     def _mouse_click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> None:
@@ -955,62 +1501,11 @@ class DesktopAutomation:
         pyautogui.click(x, y, clicks=clicks, button=button)
 
     def _click_uia(self, target: str, hwnd: int, button: str = "left", clicks: int = 1) -> None:
-        try:
-            import comtypes
-            import uiautomation as auto
-        except Exception as exc:
-            raise AutomationError("UI element search is unavailable on this system.") from exc
-        comtypes.CoInitialize()
-        try:
-            auto.SetGlobalSearchTimeout(1.5)
-            candidates: list[int] = []
-            if hwnd:
-                candidates.append(hwnd)
-            _active_exe, active_hwnd = self._active_browser()
-            if active_hwnd and active_hwnd not in candidates:
-                candidates.append(active_hwnd)
-
-            found = None
-            for candidate_hwnd in candidates:
-                try:
-                    root = auto.ControlFromHandle(candidate_hwnd)
-                except Exception:
-                    root = None
-                if root is None:
-                    continue
-                is_browser = self._process_name_for_hwnd(candidate_hwnd) in self._BROWSER_PROCESSES
-                found = self._find_uia_control(root, target, interactive_only=is_browser)
-                if found is not None:
-                    break
-            if found is None and not candidates:
-                try:
-                    found = self._find_uia_control(
-                        auto.GetRootControl(), target, max_depth=12, max_nodes=6000
-                    )
-                except Exception:
-                    found = None
-            if found is None:
-                raise AutomationError(
-                    f"I couldn't find a visible control named \"{target}\" in the foreground window."
-                )
-            try:
-                found.SetFocus()
-            except Exception:
-                pass
-            if button == "left" and clicks == 1 and self._activate_uia_control(found):
-                time.sleep(0.1)
-                return
-            try:
-                point = found.GetClickablePoint()
-                self._mouse_click(int(point.x), int(point.y), button=button, clicks=clicks)
-            except Exception as exc:
-                raise AutomationError(f"I found \"{target}\" but couldn't click it.") from exc
-            time.sleep(0.1)
-        finally:
-            try:
-                comtypes.CoUninitialize()
-            except Exception:
-                pass
+        found, _px, _py = self._uia_click(target, hwnd, button=button, clicks=clicks)
+        if not found:
+            raise AutomationError(
+                f"I couldn't find a visible control named \"{target}\" in the foreground window."
+            )
 
     @staticmethod
     def _control_name_score(name: str, wanted: str, tokens: list[str]) -> float:
@@ -1081,13 +1576,21 @@ class DesktopAutomation:
                     continue
                 if control_type == "HyperlinkControl":
                     score += 0.10
-                elif control_type in {"ButtonControl", "MenuItemControl", "TabItemControl", "ListItemControl"}:
+                elif control_type in {
+                    "ButtonControl", "MenuItemControl", "TabItemControl",
+                    "ListItemControl", "CheckBoxControl", "RadioButtonControl",
+                }:
                     score += 0.05
                 elif control_type not in {"TextControl"}:
                     score -= 0.02
                 try:
                     if control.IsOffscreen:
-                        score -= 0.30
+                        score -= 0.60
+                except Exception:
+                    pass
+                try:
+                    if not control.IsEnabled:
+                        score -= 0.60
                 except Exception:
                     pass
                 if score > best_score:
@@ -1226,34 +1729,39 @@ class DesktopAutomation:
                 pass
 
     def _grab_screen_image(self):
-        """Captures the screen using Windows GDI BitBlt, with PyQt6 and PIL fallbacks."""
-        # Method 1: Direct Windows GDI BitBlt (100% reliable across all sessions)
+        """Captures the full virtual desktop (all monitors) with GDI/PyQt/PIL fallbacks."""
+        origin_x, origin_y, width, height = self._virtual_screen_rect()
+        # Method 1: Direct Windows GDI BitBlt (works across sessions and monitors)
         try:
             from PIL import Image
 
             gdi32 = ctypes.windll.gdi32
-            w = user32.GetSystemMetrics(0)
-            h = user32.GetSystemMetrics(1)
             hdc_screen = user32.GetDC(0)
             if hdc_screen:
                 try:
                     hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
                     if hdc_mem:
                         try:
-                            hbm = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+                            hbm = gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
                             if hbm:
                                 try:
                                     gdi32.SelectObject(hdc_mem, hbm)
-                                    gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, 0, 0, 0x00CC0020)
+                                    gdi32.BitBlt(
+                                        hdc_mem, 0, 0, width, height,
+                                        hdc_screen, origin_x, origin_y, 0x00CC0020,
+                                    )
                                     bi = ctypes.c_buffer(40)
                                     ctypes.c_ulong.from_buffer(bi, 0).value = 40
-                                    ctypes.c_long.from_buffer(bi, 4).value = w
-                                    ctypes.c_long.from_buffer(bi, 8).value = -h
+                                    ctypes.c_long.from_buffer(bi, 4).value = width
+                                    ctypes.c_long.from_buffer(bi, 8).value = -height
                                     ctypes.c_ushort.from_buffer(bi, 12).value = 1
                                     ctypes.c_ushort.from_buffer(bi, 14).value = 32
-                                    buf = ctypes.create_string_buffer(w * h * 4)
-                                    gdi32.GetDIBits(hdc_mem, hbm, 0, h, buf, bi, 0)
-                                    return Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
+                                    buf = ctypes.create_string_buffer(width * height * 4)
+                                    gdi32.GetDIBits(hdc_mem, hbm, 0, height, buf, bi, 0)
+                                    self._last_grab_origin = (origin_x, origin_y)
+                                    return Image.frombuffer(
+                                        "RGBA", (width, height), buf, "raw", "BGRA", 0, 1
+                                    ).convert("RGB")
                                 finally:
                                     gdi32.DeleteObject(hbm)
                         finally:
@@ -1263,7 +1771,7 @@ class DesktopAutomation:
         except Exception:
             pass
 
-        # Method 2: PyQt6 screen capture
+        # Method 2: PyQt6 screen capture (primary screen only)
         try:
             import io
             from PIL import Image
@@ -1282,24 +1790,54 @@ class DesktopAutomation:
                         pix.save(qbuf, "PNG")
                         data = bytes(qbuf.data())
                         qbuf.close()
+                        self._last_grab_origin = (0, 0)
                         return Image.open(io.BytesIO(data))
         except Exception:
             pass
 
         # Method 3: Pillow ImageGrab fallback
         from PIL import ImageGrab
-        return ImageGrab.grab(all_screens=False)
+
+        self._last_grab_origin = (origin_x, origin_y)
+        try:
+            return ImageGrab.grab(all_screens=True)
+        except Exception:
+            self._last_grab_origin = (0, 0)
+            return ImageGrab.grab(all_screens=False)
+
+    def _grab_screen_with_origin(self):
+        """Capture the virtual desktop and report where its (0, 0) sits."""
+        image = self._grab_screen_image()
+        origin_x, origin_y = self._last_grab_origin
+        return image, int(origin_x), int(origin_y)
 
     def _screenshot(self) -> ExecutionResult:
-        folder = pictures_dir()
-        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        path = folder / f"Needle_Screenshot_{stamp}.png"
+        # Capture to a temporary file only, so screenshots are never left
+        # sitting in Pictures/Needle. Telegram uploads the file and deletes it;
+        # any leftover temp file is swept up shortly afterwards.
+        import os as _os
+        import tempfile as _tempfile
+
         image = self._grab_screen_image()
+        fd, temp_name = _tempfile.mkstemp(suffix=".png", prefix="Needle_Screenshot_")
+        _os.close(fd)
+        path = Path(temp_name)
         image.save(path, "PNG")
+
+        # Sweep up the temp file if nobody (e.g. Telegram) deletes it first.
+        def _cleanup() -> None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        timer = threading.Timer(120.0, _cleanup)
+        timer.daemon = True
+        timer.start()
 
         fg = win.get_foreground_window()
         title = win.get_window_title(fg) if fg else ""
-        msg = f"Saved a screenshot to {path.name}."
+        msg = "Captured a screenshot (not saved to disk)."
         if title:
             msg += f" (Active window: {title})"
         return ExecutionResult(True, msg, "take_screenshot", path=str(path))
@@ -1477,11 +2015,44 @@ class DesktopAutomation:
         time.sleep(0.16)
         return ExecutionResult(True, f"Switched to {info.title}.", "focus_window")
 
-    def _window_manage(self, title: str, action: str) -> ExecutionResult:
+    def _window_manage(self, title: str, action: str, width=None, height=None, x=None, y=None, value=None) -> ExecutionResult:
+        action = (action or "").strip().lower()
+        import pygetwindow as gw
+
+        if action == "list":
+            wins = [w.title for w in gw.getAllWindows() if w.title.strip()]
+            return ExecutionResult(True, "\n".join(wins) if wins else "No windows.", "window_manage")
+
+        if action == "minimize_all":
+            for w in gw.getAllWindows():
+                try:
+                    w.minimize()
+                except Exception:
+                    pass
+            return ExecutionResult(True, "Minimized all windows.", "window_manage")
+
+        if action == "restore_all":
+            for w in gw.getAllWindows():
+                try:
+                    w.restore()
+                except Exception:
+                    pass
+            return ExecutionResult(True, "Restored all windows.", "window_manage")
+
+        if action in {"snap_left", "snap_right"}:
+            w = gw.getActiveWindow()
+            if w is None:
+                raise AutomationError("No active window.")
+            try:
+                w.restore()
+                time.sleep(0.1)
+                import pyautogui
+                pyautogui.hotkey("win", "left" if action == "snap_left" else "right")
+            except Exception as exc:
+                raise AutomationError(f"Snap failed: {exc}") from exc
+            return ExecutionResult(True, f"Snapped window {'left' if action == 'snap_left' else 'right'}.", "window_manage")
+
         title = self._resolve_alias(title)
-        normalized = normalize_window_action(action)
-        if not normalized:
-            raise AutomationError("Use minimize, maximize, or restore.")
         matches = self._windows_by_title(title)
         if not matches:
             raise AutomationError(f"I couldn't find a window titled \"{title}\".")
@@ -1489,15 +2060,65 @@ class DesktopAutomation:
             titles = ", ".join(info.title for info in matches[:4])
             raise AutomationError(f"Several windows match \"{title}\": {titles}.")
         info = matches[0]
-        commands = {
-            "minimize": SW_MINIMIZE,
-            "maximize": SW_MAXIMIZE,
-            "restore": win.SW_RESTORE,
-        }
-        win.show_window(info.hwnd, commands[normalized])
-        time.sleep(0.18)
-        labels = {"minimize": "Minimized", "maximize": "Maximized", "restore": "Restored"}
-        return ExecutionResult(True, f"{labels[normalized]} {info.title}.", "window_manage")
+        hwnd = info.hwnd
+
+        if action == "focus":
+            win.focus_window(hwnd)
+            time.sleep(0.18)
+            return ExecutionResult(True, f"Focused {info.title}.", "window_manage")
+        if action == "close":
+            try:
+                win.show_window(hwnd, 0)  # SW_HIDE? use close via WM_CLOSE
+            except Exception:
+                pass
+            import ctypes
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+            time.sleep(0.2)
+            return ExecutionResult(True, f"Closed {info.title}.", "window_manage")
+        if action in {"minimize", "maximize", "restore"}:
+            commands = {"minimize": SW_MINIMIZE, "maximize": SW_MAXIMIZE, "restore": win.SW_RESTORE}
+            win.show_window(hwnd, commands[action])
+            time.sleep(0.18)
+            labels = {"minimize": "Minimized", "maximize": "Maximized", "restore": "Restored"}
+            return ExecutionResult(True, f"{labels[action]} {info.title}.", "window_manage")
+        if action == "resize":
+            rect = win.get_window_rect(hwnd)
+            try:
+                new_w = int(width) if width is not None else (rect[2] - rect[0])
+                new_h = int(height) if height is not None else (rect[3] - rect[1])
+            except (TypeError, ValueError):
+                raise AutomationError("width and height are required for resize.")
+            import ctypes
+            ctypes.windll.user32.MoveWindow(hwnd, rect[0], rect[1], new_w, new_h, True)
+            time.sleep(0.18)
+            return ExecutionResult(True, f"Resized {info.title}.", "window_manage")
+        if action == "move":
+            rect = win.get_window_rect(hwnd)
+            try:
+                new_x = int(x) if x is not None else rect[0]
+                new_y = int(y) if y is not None else rect[1]
+            except (TypeError, ValueError):
+                raise AutomationError("x and y are required for move.")
+            import ctypes
+            ctypes.windll.user32.MoveWindow(hwnd, new_x, new_y, rect[2]-rect[0], rect[3]-rect[1], True)
+            time.sleep(0.18)
+            return ExecutionResult(True, f"Moved {info.title}.", "window_manage")
+        if action == "always_on_top":
+            import ctypes
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+            return ExecutionResult(True, f"Pinned {info.title} on top.", "window_manage")
+        if action == "unpin":
+            import ctypes
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            ctypes.windll.user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+            return ExecutionResult(True, f"Unpinned {info.title}.", "window_manage")
+        raise AutomationError(f"Unsupported window action: {action}")
 
     def _system_control(self, action: str) -> ExecutionResult:
         normalized = normalize_system_action(action)
@@ -1525,13 +2146,22 @@ class DesktopAutomation:
             from .vision import crop_to_rect, ocr_image
         except Exception as exc:
             raise AutomationError(f"Screen reading is unavailable: {exc}") from exc
-        image = self._grab_screen_image()
+        image, origin_x, origin_y = self._grab_screen_with_origin()
         scope = scope if scope in {"foreground", "full"} else "foreground"
         title = ""
         if scope == "foreground":
             hwnd = win.get_foreground_window()
             title = win.get_window_title(hwnd) if hwnd else ""
-            rect = win.get_window_rect(hwnd) if hwnd else (0, 0, *image.size)
+            if hwnd:
+                left, top, right, bottom = win.get_window_rect(hwnd)
+                rect = (
+                    left - origin_x,
+                    top - origin_y,
+                    right - origin_x,
+                    bottom - origin_y,
+                )
+            else:
+                rect = (0, 0, image.width, image.height)
             image = crop_to_rect(image, rect)
         text = ocr_image(image)
         folder = pictures_dir()
@@ -1551,6 +2181,482 @@ class DesktopAutomation:
             message += f" (Window: {title})"
         message += f"\n\n{preview}"
         return ExecutionResult(True, message, "read_screen", path=str(path) if path else None)
+
+    def _audio_control(self, action: str, value) -> ExecutionResult:
+        action = (action or "").strip().lower()
+        try:
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            from comtypes import CLSCTX_ALL
+            from ctypes import cast, POINTER
+
+            speakers = AudioUtilities.GetSpeakers()
+            endpoint = getattr(speakers, "EndpointVolume", None)
+            if endpoint is None:
+                interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+            volume = endpoint.QueryInterface(IAudioEndpointVolume)
+        except Exception as exc:
+            raise AutomationError(f"Audio control unavailable: {exc}") from exc
+
+        if action == "mute":
+            volume.SetMute(1, None)
+            return ExecutionResult(True, "Sound muted.", "audio_control")
+        if action == "unmute":
+            volume.SetMute(0, None)
+            return ExecutionResult(True, "Sound unmuted.", "audio_control")
+        if action in {"mic_mute", "mic_unmute"}:
+            try:
+                mic = AudioUtilities.GetMicrophone()
+                ep = getattr(mic, "EndpointVolume", None)
+                if ep is None:
+                    interface = mic.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                    ep = cast(interface, POINTER(IAudioEndpointVolume))
+                mv = ep.QueryInterface(IAudioEndpointVolume)
+                mv.SetMute(1 if action == "mic_mute" else 0, None)
+                return ExecutionResult(
+                    True,
+                    "Microphone muted." if action == "mic_mute" else "Microphone unmuted.",
+                    "audio_control",
+                )
+            except Exception as exc:
+                raise AutomationError(f"Microphone control failed: {exc}") from exc
+        current = round(volume.GetMasterVolumeLevelScalar() * 100)
+        if action == "get_volume":
+            return ExecutionResult(True, f"Volume is {current}%.", "audio_control")
+        if action == "volume_up":
+            new = min(100, current + 10)
+            volume.SetMasterVolumeLevelScalar(new / 100.0, None)
+            return ExecutionResult(True, f"Volume set to {new}%.", "audio_control")
+        if action == "volume_down":
+            new = max(0, current - 10)
+            volume.SetMasterVolumeLevelScalar(new / 100.0, None)
+            return ExecutionResult(True, f"Volume set to {new}%.", "audio_control")
+        if action == "set_volume":
+            try:
+                lvl = max(0, min(100, int(value)))
+            except (TypeError, ValueError):
+                raise AutomationError("A volume level (0-100) is required.")
+            volume.SetMasterVolumeLevelScalar(lvl / 100.0, None)
+            return ExecutionResult(True, f"Volume set to {lvl}%.", "audio_control")
+        raise AutomationError(f"Unknown audio action: {action}")
+
+    def _display_control(self, action: str, value) -> ExecutionResult:
+        action = (action or "").strip().lower()
+        import screen_brightness_control as sbc
+
+        if action == "get_brightness":
+            cur = sbc.get_brightness()
+            cur = cur[0] if isinstance(cur, (list, tuple)) and cur else cur
+            return ExecutionResult(True, f"Brightness is {cur}%.", "display_control")
+        if action in {"brightness_up", "brightness_down", "set_brightness"}:
+            try:
+                cur = sbc.get_brightness()
+                cur = cur[0] if isinstance(cur, (list, tuple)) and cur else cur
+                cur = int(cur)
+            except Exception:
+                cur = 50
+            if action == "brightness_up":
+                new = min(100, cur + 10)
+            elif action == "brightness_down":
+                new = max(0, cur - 10)
+            else:
+                try:
+                    new = max(0, min(100, int(value)))
+                except (TypeError, ValueError):
+                    raise AutomationError("A brightness level (0-100) is required.")
+            sbc.set_brightness(new)
+            return ExecutionResult(True, f"Brightness set to {new}%.", "display_control")
+        if action in {"screen_off", "screen_on"}:
+            import ctypes
+            if action == "screen_off":
+                ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)
+                return ExecutionResult(True, "Screen turned off.", "display_control")
+            ctypes.windll.user32.mouse_event(0x0001, 1, 1, 0, 0)
+            return ExecutionResult(True, "Screen woken.", "display_control")
+        if action in {"night_mode_on", "night_mode_off"}:
+            # Toggle Windows Night Light via the quick-settings URI (best effort).
+            try:
+                import os
+                os.startfile("ms-settings:nightlight")
+            except Exception:
+                pass
+            state = "on" if action == "night_mode_on" else "off"
+            return ExecutionResult(
+                True,
+                f"Opened Night light settings (turn it {state} there).",
+                "display_control",
+            )
+        raise AutomationError(f"Unknown display action: {action}")
+
+    def _connectivity_control(self, action: str) -> ExecutionResult:
+        action = (action or "").strip().lower()
+        import subprocess
+
+        def _run(args):
+            return subprocess.run(args, capture_output=True, text=True, timeout=20)
+
+        if action == "wifi_status":
+            res = _run(["netsh", "wlan", "show", "interfaces"])
+            text = (res.stdout or res.stderr or "").strip()
+            return ExecutionResult(True, text or "No Wi-Fi info.", "connectivity_control")
+        if action == "wifi_on":
+            # Enable the Wi-Fi adapter (best effort; may require admin).
+            res = _run(["powershell", "-Command",
+                        "Enable-NetAdapter -Name 'Wi-Fi' -Confirm:$false -ErrorAction SilentlyContinue"])
+            if res.returncode != 0:
+                res = _run(["netsh", "interface", "set", "interface", "Wi-Fi", "admin=enabled"])
+            msg = (res.stdout or "").strip() or "Wi-Fi enable requested."
+            if res.returncode != 0 and not msg:
+                msg = (res.stderr or "").strip() or "Failed to enable Wi-Fi (try as admin)."
+            return ExecutionResult(res.returncode == 0, msg, "connectivity_control")
+        if action == "wifi_off":
+            res = _run(["powershell", "-Command",
+                        "Disable-NetAdapter -Name 'Wi-Fi' -Confirm:$false -ErrorAction SilentlyContinue"])
+            if res.returncode != 0:
+                res = _run(["netsh", "interface", "set", "interface", "Wi-Fi", "admin=disabled"])
+            msg = (res.stdout or "").strip() or "Wi-Fi disable requested."
+            if res.returncode != 0 and not msg:
+                msg = (res.stderr or "").strip() or "Failed to disable Wi-Fi (try as admin)."
+            return ExecutionResult(res.returncode == 0, msg, "connectivity_control")
+        if action == "bluetooth_status":
+            res = _run(["powershell", "-Command",
+                        "Get-PnpDevice -Class Bluetooth | Select-Object -ExpandProperty Status"])
+            text = (res.stdout or res.stderr or "").strip()
+            return ExecutionResult(True, text or "No Bluetooth info.", "connectivity_control")
+        if action in {"bluetooth_on", "bluetooth_off"}:
+            # Toggle via the radio management PowerShell module (best effort).
+            state = "On" if action == "bluetooth_on" else "Off"
+            cmd = (
+                "Get-PnpDevice -Class Bluetooth | ForEach-Object { "
+                f"if ('{state}' -eq 'On') {{ Enable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false }} "
+                f"else {{ Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false }} "
+                "}"
+            )
+            res = _run(["powershell", "-Command", cmd])
+            msg = (res.stdout or "").strip() or f"Bluetooth {state.lower()} requested."
+            if res.returncode != 0 and not msg:
+                msg = (res.stderr or "").strip() or f"Failed to toggle Bluetooth (try as admin)."
+            return ExecutionResult(res.returncode == 0, msg, "connectivity_control")
+        if action in {"airplane_on", "airplane_off"}:
+            # Airplane mode is a quick-action; open the network flyout as a fallback.
+            try:
+                import os
+                os.startfile("ms-settings:network-airplanemode")
+            except Exception:
+                pass
+            state = "on" if action == "airplane_on" else "off"
+            return ExecutionResult(True, f"Opened Airplane mode settings (turn it {state} there).",
+                                  "connectivity_control")
+        if action == "connected_devices":
+            res = _run(["arp", "-a"])
+            text = (res.stdout or "").strip()
+            if not text:
+                text = "No device list available."
+            return ExecutionResult(True, text[:3000], "connectivity_control")
+        raise AutomationError(f"Unknown connectivity action: {action}")
+
+    def _weather_report(self, city: str) -> ExecutionResult:
+        import requests
+
+        city = (city or "").strip()
+        if not city:
+            raise AutomationError("A city is required.")
+        try:
+            resp = requests.get(f"https://wttr.in/{city}?format=3", timeout=10)
+            text = (resp.text or "").strip()
+            if not text or "Unknown location" in text:
+                raise AutomationError(f"Could not get weather for {city}.")
+            return ExecutionResult(True, text, "weather_report")
+        except Exception as exc:
+            raise AutomationError(f"Weather lookup failed: {exc}") from exc
+
+    def _notes_path(self) -> Path:
+        base = Path(__file__).resolve().parent.parent
+        folder = base / "data"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / "notes.json"
+
+    def _load_notes(self) -> list[dict[str, Any]]:
+        import json as _json
+        path = self._notes_path()
+        if not path.exists():
+            return []
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = _json.load(fh)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_notes(self, notes: list[dict[str, Any]]) -> None:
+        import json as _json
+        with open(self._notes_path(), "w", encoding="utf-8") as fh:
+            _json.dump(notes, fh, indent=2, ensure_ascii=False)
+
+    def _notes(self, action: str, title: str, content: str, query: str) -> ExecutionResult:
+        action = (action or "").strip().lower() or "list"
+        notes = self._load_notes()
+        if action == "save":
+            title = (title or "Untitled").strip()[:120]
+            notes = [n for n in notes if n.get("title") != title]
+            notes.append({"title": title, "content": content or ""})
+            self._save_notes(notes)
+            return ExecutionResult(True, f"Saved note '{title}'.", "notes")
+        if action == "list":
+            if not notes:
+                return ExecutionResult(True, "No notes saved.", "notes")
+            titles = ", ".join(n.get("title", "?") for n in notes)
+            return ExecutionResult(True, f"Notes: {titles}", "notes")
+        if action == "read":
+            needle = (query or title or "").strip().lower()
+            matches = [n for n in notes if not needle or needle in str(n.get("title", "")).lower()
+                       or needle in str(n.get("content", "")).lower()]
+            if not matches:
+                return ExecutionResult(True, "No matching note found.", "notes")
+            parts = [f"{n.get('title')}: {n.get('content')}" for n in matches]
+            return ExecutionResult(True, "\n".join(parts), "notes")
+        if action == "delete":
+            needle = (title or query or "").strip().lower()
+            before = len(notes)
+            notes = [n for n in notes if needle and needle not in str(n.get("title", "")).lower()]
+            self._save_notes(notes)
+            removed = before - len(notes)
+            return ExecutionResult(True, f"Deleted {removed} note(s).", "notes")
+        raise AutomationError(f"Unknown notes action: {action}")
+
+    def _knowledge_path(self) -> Path:
+        base = Path(__file__).resolve().parent.parent
+        folder = base / "data"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / "knowledge.json"
+
+    def _load_knowledge(self) -> list[str]:
+        import json as _json
+        path = self._knowledge_path()
+        if not path.exists():
+            return []
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = _json.load(fh)
+            return [str(x) for x in data] if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _save_knowledge(self, facts: list[str]) -> None:
+        import json as _json
+        with open(self._knowledge_path(), "w", encoding="utf-8") as fh:
+            _json.dump(facts, fh, indent=2, ensure_ascii=False)
+
+    def _knowledge(self, action: str, fact: str, query: str) -> ExecutionResult:
+        action = (action or "").strip().lower() or "list"
+        facts = self._load_knowledge()
+        if action == "store":
+            fact = (fact or "").strip()
+            if not fact:
+                raise AutomationError("Nothing to store.")
+            facts.append(fact)
+            self._save_knowledge(facts)
+            return ExecutionResult(True, "Noted and stored.", "knowledge")
+        if action == "list":
+            if not facts:
+                return ExecutionResult(True, "No stored facts.", "knowledge")
+            return ExecutionResult(True, "\n".join(f"- {f}" for f in facts), "knowledge")
+        if action == "recall":
+            needle = (query or "").strip().lower()
+            matches = [f for f in facts if not needle or needle in f.lower()]
+            if not matches:
+                return ExecutionResult(True, "Nothing matched.", "knowledge")
+            return ExecutionResult(True, "\n".join(f"- {f}" for f in matches), "knowledge")
+        if action == "forget":
+            needle = (query or fact or "").strip().lower()
+            before = len(facts)
+            facts = [f for f in facts if needle and needle not in f.lower()]
+            self._save_knowledge(facts)
+            return ExecutionResult(True, f"Removed {before - len(facts)} fact(s).", "knowledge")
+        raise AutomationError(f"Unknown knowledge action: {action}")
+
+    def _file_search(self, query: str, path: str) -> ExecutionResult:
+        import fnmatch
+        query = (query or "").strip()
+        if not query:
+            raise AutomationError("A search query is required.")
+        root = Path(path).expanduser() if path.strip() else Path.home()
+        if not root.exists():
+            raise AutomationError(f"Folder not found: {root}")
+        results: list[str] = []
+        try:
+            for p in root.rglob("*"):
+                if fnmatch.fnmatch(p.name.lower(), f"*{query.lower()}*"):
+                    results.append(str(p))
+                    if len(results) >= 50:
+                        break
+        except Exception as exc:
+            raise AutomationError(f"Search failed: {exc}") from exc
+        if not results:
+            return ExecutionResult(True, f"No files matching '{query}' found.", "file_search")
+        return ExecutionResult(True, "\n".join(results[:50]), "file_search")
+
+    def _navigate_screen(self, action: str) -> ExecutionResult:
+        action = (action or "").strip().lower()
+        import pyautogui
+        mapping = {
+            "scroll_up": lambda: pyautogui.scroll(500),
+            "scroll_down": lambda: pyautogui.scroll(-500),
+            "next_tab": lambda: pyautogui.hotkey("ctrl", "tab"),
+            "prev_tab": lambda: pyautogui.hotkey("ctrl", "shift", "tab"),
+            "switch_app": lambda: pyautogui.hotkey("alt", "tab"),
+            "minimize_all": lambda: pyautogui.hotkey("win", "d"),
+            "close_tab": lambda: pyautogui.hotkey("ctrl", "w"),
+        }
+        if action not in mapping:
+            raise AutomationError(f"Unknown navigation action: {action}")
+        try:
+            mapping[action]()
+        except Exception as exc:
+            raise AutomationError(f"Navigation failed: {exc}") from exc
+        labels = {
+            "scroll_up": "Scrolled up", "scroll_down": "Scrolled down",
+            "next_tab": "Switched to next tab", "prev_tab": "Switched to previous tab",
+            "switch_app": "Switched application", "minimize_all": "Minimized all windows",
+            "close_tab": "Closed the current tab",
+        }
+        return ExecutionResult(True, labels.get(action, "Done."), "navigate_screen")
+
+    def _email(self, action: str, to: str = "", subject: str = "", body: str = "",
+               cc: str = "", max_results=None, unread_only: bool = True, query: str = "") -> ExecutionResult:
+        action = (action or "").strip().lower()
+        import os, smtplib, imaplib, email
+        from email.message import EmailMessage
+
+        if action == "send":
+            to = (to or "").strip()
+            if not to:
+                raise AutomationError("A recipient (to) is required.")
+            smtp_host = os.environ.get("NEEDLE_SMTP_HOST", "")
+            smtp_port = int(os.environ.get("NEEDLE_SMTP_PORT", "587"))
+            smtp_user = os.environ.get("NEEDLE_SMTP_USER", "")
+            smtp_pass = os.environ.get("NEEDLE_SMTP_PASS", "")
+            if not (smtp_host and smtp_user and smtp_pass):
+                raise AutomationError(
+                    "Email is not configured. Set NEEDLE_SMTP_HOST/PORT/USER/PASS env vars."
+                )
+            msg = EmailMessage()
+            msg["From"] = smtp_user
+            msg["To"] = to
+            if cc:
+                msg["Cc"] = cc
+            msg["Subject"] = subject or "(no subject)"
+            msg.set_content(body or "")
+            try:
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                    server.starttls()
+                    server.login(smtp_user, smtp_pass)
+                    server.send_message(msg)
+            except Exception as exc:
+                raise AutomationError(f"Failed to send email: {exc}") from exc
+            return ExecutionResult(True, f"Email sent to {to}.", "email")
+
+        if action == "read":
+            imap_host = os.environ.get("NEEDLE_IMAP_HOST", "")
+            imap_user = os.environ.get("NEEDLE_IMAP_USER", os.environ.get("NEEDLE_SMTP_USER", ""))
+            imap_pass = os.environ.get("NEEDLE_IMAP_PASS", os.environ.get("NEEDLE_SMTP_PASS", ""))
+            if not (imap_host and imap_user and imap_pass):
+                raise AutomationError(
+                    "Email is not configured. Set NEEDLE_IMAP_HOST/USER/PASS env vars."
+                )
+            limit = 5
+            try:
+                if max_results is not None:
+                    limit = max(1, min(50, int(max_results)))
+            except (TypeError, ValueError):
+                pass
+            try:
+                mail = imaplib.IMAP4_SSL(imap_host)
+                mail.login(imap_user, imap_pass)
+                mail.select("INBOX")
+                criteria = "UNSEEN" if unread_only else "ALL"
+                if query:
+                    criteria = f'({criteria} SUBJECT "{query}")'
+                status, data = mail.search(None, criteria)
+                ids = data[0].split() if data and data[0] else []
+                ids = ids[-limit:]
+                lines: list[str] = []
+                for mid in ids:
+                    status, msg_data = mail.fetch(mid, "(RFC822)")
+                    if not msg_data or not msg_data[0]:
+                        continue
+                    raw = msg_data[0][1]
+                    parsed = email.message_from_bytes(raw)
+                    subj = parsed.get("Subject", "")
+                    sender = parsed.get("From", "")
+                    lines.append(f"From: {sender}\nSubject: {subj}")
+                mail.logout()
+            except Exception as exc:
+                raise AutomationError(f"Failed to read email: {exc}") from exc
+            if not lines:
+                return ExecutionResult(True, "No matching emails.", "email")
+            return ExecutionResult(True, "\n\n".join(lines), "email")
+
+        raise AutomationError(f"Unknown email action: {action}")
+
+    def _manage_browser_tabs(self, action: str, target: str = "") -> ExecutionResult:
+        action = (action or "").strip().lower()
+        import pyautogui
+        from pynput.keyboard import Controller, Key
+
+        controller = Controller()
+        if action == "new_tab":
+            with controller.pressed(Key.ctrl):
+                controller.press("t")
+                controller.release("t")
+            return ExecutionResult(True, "Opened a new tab.", "manage_browser_tabs")
+        if action == "new_chat":
+            with controller.pressed(Key.ctrl, Key.shift):
+                controller.press("o")
+                controller.release("o")
+            return ExecutionResult(True, "Opened a new chat.", "manage_browser_tabs")
+        if action == "detach_tab":
+            try:
+                import pygetwindow as gw
+                active = gw.getActiveWindow()
+                if active is not None:
+                    left, top, width = int(active.left), int(active.top), int(active.width)
+                    sx, sy = left + width // 2, top + 30
+                    pyautogui.moveTo(sx, sy)
+                    pyautogui.mouseDown()
+                    pyautogui.moveTo(sx, sy + 190, duration=0.4)
+                    pyautogui.mouseUp()
+                    return ExecutionResult(True, "Detached the active tab.", "manage_browser_tabs")
+            except Exception:
+                pass
+            with controller.pressed(Key.alt):
+                controller.press("f")
+                controller.release("f")
+            return ExecutionResult(True, "Moved tab via Alt+F.", "manage_browser_tabs")
+        if action == "merge_windows":
+            wins = []
+            try:
+                import pygetwindow as gw
+                for w in gw.getAllWindows():
+                    if w.title and any(b in w.title.lower() for b in ("chrome", "edge", "firefox", "brave")):
+                        wins.append(w)
+            except Exception:
+                wins = []
+            if not wins:
+                return ExecutionResult(False, "No browser windows found to merge.", "manage_browser_tabs")
+            for i, w in enumerate(wins):
+                try:
+                    if w.isMinimized:
+                        w.restore()
+                        time.sleep(0.2)
+                    w.activate()
+                    time.sleep(0.35)
+                    pyautogui.hotkey("win", "left" if i % 2 == 0 else "right")
+                    time.sleep(0.35)
+                except Exception:
+                    continue
+            return ExecutionResult(True, f"Snapped {len(wins)} windows side by side.", "manage_browser_tabs")
+        raise AutomationError(f"Unknown browser tab action: {action}")
 
     def _clipboard(self, action: str, text: str = "") -> ExecutionResult:
         action = action.strip().lower()
@@ -1862,7 +2968,7 @@ class DesktopAutomation:
 
     def _browser_control(self, action: str, url: str = "", browser: str = "", target: str = "", amount: int = 5) -> ExecutionResult:
         action = (action or "").strip().lower()
-        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down"}:
+        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down", "reload", "back", "forward", "fullscreen", "zoom_in", "zoom_out", "zoom_reset", "close_all", "status", "incognito", "new_chat", "detach_tab", "merge_windows", "list_windows"}:
             raise AutomationError("Unsupported browser action.")
         if action == "open_url":
             url = str(url or "").strip()
@@ -1917,6 +3023,125 @@ class DesktopAutomation:
             except OSError as exc:
                 raise AutomationError(f"Could not open the URL: {exc}") from exc
             return ExecutionResult(True, f"Opened {url}.", "browser_control")
+
+        hwnd = self._find_browser_window(browser or None)
+        if not hwnd:
+            raise AutomationError("No browser window was found. Open a browser first.")
+        win.focus_window(hwnd)
+        time.sleep(0.2)
+        from pynput.keyboard import Controller, Key
+
+        controller = Controller()
+        if action == "reload":
+            controller.press(Key.f5)
+            controller.release(Key.f5)
+            return ExecutionResult(True, "Reloaded the page.", "browser_control")
+        if action == "back":
+            with controller.pressed(Key.alt):
+                controller.press(Key.left)
+                controller.release(Key.left)
+            return ExecutionResult(True, "Went back.", "browser_control")
+        if action == "forward":
+            with controller.pressed(Key.alt):
+                controller.press(Key.right)
+                controller.release(Key.right)
+            return ExecutionResult(True, "Went forward.", "browser_control")
+        if action == "fullscreen":
+            controller.press(Key.f11)
+            controller.release(Key.f11)
+            return ExecutionResult(True, "Toggled fullscreen.", "browser_control")
+        if action == "zoom_in":
+            with controller.pressed(Key.ctrl):
+                controller.press("=")
+                controller.release("=")
+            return ExecutionResult(True, "Zoomed in.", "browser_control")
+        if action == "zoom_out":
+            with controller.pressed(Key.ctrl):
+                controller.press("-")
+                controller.release("-")
+            return ExecutionResult(True, "Zoomed out.", "browser_control")
+        if action == "zoom_reset":
+            with controller.pressed(Key.ctrl):
+                controller.press("0")
+                controller.release("0")
+            return ExecutionResult(True, "Zoom reset.", "browser_control")
+        if action == "close_all":
+            import psutil
+            exe = self._process_name_for_hwnd(hwnd) or "chrome.exe"
+            for proc in psutil.process_iter(["name", "pid"]):
+                try:
+                    if proc.info["name"] and proc.info["name"].lower() == exe.lower():
+                        proc.kill()
+                except Exception:
+                    pass
+            return ExecutionResult(True, "Closed all browser windows.", "browser_control")
+        if action == "status":
+            title = win.get_window_title(hwnd)
+            return ExecutionResult(True, f"Browser open: {title}", "browser_control")
+        if action == "list_windows":
+            import pygetwindow as gw
+            wins = [w.title for w in gw.getAllWindows() if w.title and
+                    any(b in w.title.lower() for b in ("chrome", "edge", "firefox", "brave"))]
+            return ExecutionResult(True, "\n".join(wins) if wins else "No browser windows.", "browser_control")
+        if action == "incognito":
+            exe_path = self._browser_exe_path(
+                self._BROWSER_EXE_NAMES.get("chrome", "chrome.exe")
+            )
+            if not exe_path:
+                raise AutomationError("Browser executable not found.")
+            subprocess.Popen([exe_path, "--incognito"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return ExecutionResult(True, "Opened an incognito window.", "browser_control")
+        if action == "new_chat":
+            win.focus_window(hwnd)
+            time.sleep(0.2)
+            with controller.pressed(Key.ctrl, Key.shift):
+                controller.press("o")
+                controller.release("o")
+            return ExecutionResult(True, "Opened a new chat.", "browser_control")
+        if action == "detach_tab":
+            # Drag the active tab out of the strip.
+            try:
+                import pygetwindow as gw
+                active = gw.getActiveWindow()
+                if active is not None:
+                    left, top, width = int(active.left), int(active.top), int(active.width)
+                    sx, sy = left + width // 2, top + 30
+                    import pyautogui
+                    pyautogui.moveTo(sx, sy)
+                    pyautogui.mouseDown()
+                    pyautogui.moveTo(sx, sy + 190, duration=0.4)
+                    pyautogui.mouseUp()
+                    return ExecutionResult(True, "Detached the active tab.", "browser_control")
+            except Exception:
+                pass
+            with controller.pressed(Key.alt):
+                controller.press("f")
+                controller.release("f")
+            return ExecutionResult(True, "Moved tab via Alt+F.", "browser_control")
+        if action == "merge_windows":
+            wins = []
+            try:
+                import pygetwindow as gw
+                for w in gw.getAllWindows():
+                    if w.title and any(b in w.title.lower() for b in ("chrome", "edge", "firefox", "brave")):
+                        wins.append(w)
+            except Exception:
+                wins = []
+            if not wins:
+                return ExecutionResult(False, "No browser windows found to merge.", "browser_control")
+            for i, w in enumerate(wins):
+                try:
+                    if w.isMinimized:
+                        w.restore()
+                        time.sleep(0.2)
+                    w.activate()
+                    time.sleep(0.35)
+                    import pyautogui
+                    pyautogui.hotkey("win", "left" if i % 2 == 0 else "right")
+                    time.sleep(0.35)
+                except Exception:
+                    continue
+            return ExecutionResult(True, f"Snapped {len(wins)} windows side by side.", "browser_control")
 
         hwnd = self._find_browser_window(browser or None)
         if not hwnd:

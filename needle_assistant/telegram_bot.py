@@ -451,7 +451,14 @@ class TelegramBot(QObject):
                 )
         except Exception as exc:
             log.warning("Could not send Telegram photo: %s", self._safe_error(exc))
-            self._send(chat_id, "The screenshot was saved locally, but I could not upload it.")
+            self._send(chat_id, "The screenshot was captured, but I could not upload it.")
+        finally:
+            # Screenshots are captured to temporary files only; remove them
+            # once the upload (or the failed attempt) is finished.
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------ api
     def _api(
