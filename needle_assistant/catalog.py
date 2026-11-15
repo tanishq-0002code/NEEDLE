@@ -45,15 +45,62 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "click_element",
-        "description": "Click element",
-        "triggers": [r"^(?:please\s+)?(?:click|tap)\b"],
+        "description": (
+            "Click, move, or scroll a desktop UI element. The target must be the exact "
+            "visible text of the element (for example 'Save', 'Sign in', 'File'), not a "
+            "guess. Use action for right-click, double-click, hover, scroll-to-element, "
+            "or to click the previous target again."
+        ),
+        "triggers": [
+            r"^(?:please\s+)?(?:click|tap|right[\s-]click|double[\s-]click|hover)\b"
+        ],
         "parameters": {
             "type": "object",
             "properties": {
-                "target": {"type": "string"},
-                "window": {"type": "string"},
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "Exact visible label/text of the element. Optional for "
+                        "action='click_again' or when x/y coordinates are given."
+                    ),
+                },
+                "window": {
+                    "type": "string",
+                    "description": "Optional window title to search in.",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "click", "right_click", "double_click", "move",
+                        "scroll_to", "scroll_up", "scroll_down", "click_again",
+                    ],
+                    "description": "Default is 'click'.",
+                },
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "description": "Mouse button for the click.",
+                },
+                "clicks": {
+                    "type": "integer",
+                    "description": "Number of clicks: 1 = single, 2 = double.",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down"],
+                    "description": "Scroll direction for scroll_to (default down).",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Maximum scroll steps for scroll_to (1-15, default 8).",
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "Wheel steps for scroll_up/scroll_down (default 5).",
+                },
+                "x": {"type": "integer", "description": "Optional absolute screen X."},
+                "y": {"type": "integer", "description": "Optional absolute screen Y."},
             },
-            "required": ["target"],
         },
     },
     {
@@ -74,9 +121,19 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
-                "action": {"type": "string", "enum": ["minimize", "maximize", "restore"]},
+                "action": {
+                    "type": "string",
+                    "enum": ["minimize", "maximize", "restore", "focus", "close",
+                             "minimize_all", "restore_all", "snap_left", "snap_right",
+                             "resize", "move", "always_on_top", "unpin", "list"],
+                },
+                "width": {"type": "integer"},
+                "height": {"type": "integer"},
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "value": {"type": "integer"},
             },
-            "required": ["title", "action"],
+            "required": ["action"],
         },
     },
     {
@@ -224,7 +281,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down"],
+                    "enum": ["open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down", "reload", "back", "forward", "fullscreen", "zoom_in", "zoom_out", "zoom_reset", "close_all", "status", "incognito", "new_chat", "detach_tab", "merge_windows", "list_windows"],
                 },
                 "url": {"type": "string"},
                 "browser": {"type": "string"},
@@ -311,6 +368,136 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["recipient"],
         },
     },
+    {
+        "name": "audio_control",
+        "description": "Control system volume and microphone. Actions: volume_up, volume_down, set_volume, mute, unmute, mic_mute, mic_unmute, get_volume.",
+        "triggers": [r"\b(?:volume|mute|unmute|microphone|mic)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "value": {"type": "integer", "description": "Volume 0-100 for set_volume."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "display_control",
+        "description": "Control screen brightness and display. Actions: brightness_up, brightness_down, set_brightness, get_brightness, night_mode_on, night_mode_off, screen_off, screen_on.",
+        "triggers": [r"\b(?:brightness|night mode|screen off|screen on|display)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "value": {"type": "integer", "description": "Brightness 0-100 for set_brightness."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "connectivity_control",
+        "description": "Control WiFi, Bluetooth, Airplane mode. Actions: wifi_on, wifi_off, wifi_status, bluetooth_on, bluetooth_off, bluetooth_status, airplane_on, airplane_off, connected_devices.",
+        "triggers": [r"\b(?:wifi|wi-fi|bluetooth|airplane mode|network)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "weather_report",
+        "description": "Get current weather for a city.",
+        "triggers": [r"\b(?:weather|temperature|forecast)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+    {
+        "name": "notes",
+        "description": "Save, read, or delete personal notes.",
+        "triggers": [r"\b(?:note|notes)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["save", "read", "delete", "list"]},
+                "title": {"type": "string"},
+                "content": {"type": "string"},
+                "query": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "knowledge",
+        "description": "Store, recall, or forget facts about the user.",
+        "triggers": [r"\b(?:remember that|recall|forget)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["store", "recall", "forget", "list"]},
+                "fact": {"type": "string"},
+                "query": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "file_search",
+        "description": "Search for files by name or pattern under a folder.",
+        "triggers": [r"\b(?:find file|search file|locate file)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "navigate_screen",
+        "description": "Navigate the screen/tabs. Actions: scroll_up, scroll_down, next_tab, prev_tab, switch_app, minimize_all, close_tab.",
+        "triggers": [r"\b(?:next tab|previous tab|switch app|minimize all|close tab)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "email",
+        "description": "Read inbox or send an email. Actions: read, send.",
+        "triggers": [r"\b(?:email|mail|inbox)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["read", "send"]},
+                "to": {"type": "string"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
+                "cc": {"type": "string"},
+                "max_results": {"type": "integer"},
+                "unread_only": {"type": "boolean"},
+                "query": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "manage_browser_tabs",
+        "description": "Advanced browser tab/window actions: new_chat, new_tab, detach_tab, merge_windows.",
+        "triggers": [r"\b(?:detach tab|merge windows|new chat)\b"],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["new_chat", "new_tab", "detach_tab", "merge_windows"]},
+                "target": {"type": "string"},
+            },
+            "required": ["action"],
+        },
+    },
 ]
 
 SYSTEM_PROMPT = "device: Windows desktop"
@@ -376,6 +563,18 @@ _DOUBLE_CLICK_RE = re.compile(
 )
 _SCROLL_RE = re.compile(
     r"^(?:please\s+)?scroll\s+(up|down)(?:\s+(\d+))?[.!?]*$",
+    re.I,
+)
+_SCROLL_TO_RE = re.compile(
+    r"^(?:please\s+)?(?:scroll|page)\s+(up|down)\s+(?:"
+    r"(?:to|until|till)\s+(?:you\s+)?(?:(?:see|find|reach|get\s+to)\s+)?"
+    r"|and\s+(?:find|look\s+for)\s+"
+    r")(.+?)[.!?]*$",
+    re.I,
+)
+_CLICK_AGAIN_RE = re.compile(
+    r"^(?:please\s+)?(?:click|tap)\s+(?:it|that|this|the\s+same(?:\s+(?:one|thing))?)"
+    r"\s+again[.!?]*$",
     re.I,
 )
 _CLOSE_RE = re.compile(
@@ -508,6 +707,65 @@ def _clean_click_target(value: str) -> str:
     return target.strip()
 
 
+_CLICK_ACTIONS = frozenset({
+    "click", "right_click", "double_click", "move",
+    "scroll_to", "scroll_up", "scroll_down", "click_again",
+})
+_CLICK_ACTION_ALIASES = {
+    "right": "right_click",
+    "rightclick": "right_click",
+    "double": "double_click",
+    "doubleclick": "double_click",
+    "hover": "move",
+    "move_cursor": "move",
+    "move_mouse": "move",
+    "again": "click_again",
+    "repeat": "click_again",
+    "scroll": "scroll_down",
+    "scrollto": "scroll_to",
+    "scroll_down_to": "scroll_to",
+    "scroll_up_to": "scroll_to",
+}
+_CLICK_PREFIX_ACTIONS = (
+    (re.compile(r"^(?:please\s+)?right[\s-]click(?:\s+(?:on|at))?\s*", re.I), "right_click"),
+    (re.compile(r"^(?:please\s+)?double[\s-]click(?:\s+(?:on|at))?\s*", re.I), "double_click"),
+    (re.compile(r"^(?:please\s+)?middle[\s-]click(?:\s+(?:on|at))?\s*", re.I), "click"),
+    (
+        re.compile(
+            r"^(?:please\s+)?(?:move\s+(?:the\s+)?(?:cursor|mouse)\s*(?:to\s+)?"
+            r"|hover\s+(?:over\s+)?)",
+            re.I,
+        ),
+        "move",
+    ),
+)
+_CLICK_AGAIN_TARGET_RE = re.compile(
+    r"(?:it|that|this|the\s+same(?:\s+(?:one|thing))?)\s+again", re.I
+)
+
+
+def _normalize_click_action(action: str, target: str) -> tuple[str, str]:
+    """Return a validated action plus the remaining element target."""
+    normalized = re.sub(r"[\s-]+", "_", _compact(action).lower())
+    normalized = _CLICK_ACTION_ALIASES.get(normalized, normalized)
+    if normalized not in _CLICK_ACTIONS:
+        normalized = ""
+    for pattern, implied in _CLICK_PREFIX_ACTIONS:
+        match = pattern.match(target)
+        if not match:
+            continue
+        if not normalized:
+            normalized = implied
+        target = target[match.end():].strip()
+        break
+    if _CLICK_AGAIN_TARGET_RE.fullmatch(target.strip()):
+        normalized = "click_again"
+        target = ""
+    if not normalized:
+        normalized = "click"
+    return normalized, target.strip()
+
+
 _GENERIC_WINDOW_TARGETS = {"window", "it", "this", "that", "app", "current window"}
 _SYSTEM_VERBS = {
     "shut down": "shutdown",
@@ -529,6 +787,20 @@ _WINDOW_ACTIONS = {
     "restore": "restore",
     "unminimize": "restore",
     "unminimise": "restore",
+    "focus": "focus",
+    "switch": "focus",
+    "close": "close",
+    "minimize_all": "minimize_all",
+    "minimise_all": "minimize_all",
+    "restore_all": "restore_all",
+    "snap_left": "snap_left",
+    "snap_right": "snap_right",
+    "resize": "resize",
+    "move": "move",
+    "always_on_top": "always_on_top",
+    "pin": "always_on_top",
+    "unpin": "unpin",
+    "list": "list",
 }
 
 
@@ -807,13 +1079,60 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
             result["window"] = window[:200]
         return name, result
     if name == "click_element":
-        target = _clean_click_target(str(arguments.get("target", "")))
-        if not target:
-            raise ValueError("A click target is required.")
-        if len(target) > 200 or re.search(r"[\x00-\x1f]", target):
+        raw_target = _clean_click_target(str(arguments.get("target", "")))
+        action, target = _normalize_click_action(
+            str(arguments.get("action", "") or ""), raw_target
+        )
+        if target and (len(target) > 200 or re.search(r"[\x00-\x1f]", target)):
             raise ValueError("The click target is invalid.")
+        if action == "click_again":
+            target = ""
+        has_point = arguments.get("x") is not None and arguments.get("y") is not None
+        if not target and not has_point and action not in {
+            "scroll_up", "scroll_down", "click_again",
+        }:
+            raise ValueError("A click target is required.")
+        button = _compact(str(arguments.get("button", "") or "")).lower()
+        if button not in {"left", "right", "middle"}:
+            button = "right" if action == "right_click" else "left"
+        try:
+            clicks = int(arguments.get("clicks", 0) or 0)
+        except (TypeError, ValueError):
+            clicks = 0
+        if action == "double_click":
+            clicks = 2
+        elif clicks not in {1, 2, 3}:
+            clicks = 1
+        direction = _compact(str(arguments.get("direction", "") or "")).lower() or "down"
+        if direction not in {"up", "down"}:
+            direction = "down"
+        try:
+            max_steps = int(arguments.get("max_steps", 8) or 8)
+        except (TypeError, ValueError):
+            max_steps = 8
+        max_steps = max(1, min(15, max_steps))
+        try:
+            amount = int(arguments.get("amount", 5) or 5)
+        except (TypeError, ValueError):
+            amount = 5
+        amount = max(1, min(50, amount))
+        result: dict[str, Any] = {"target": target, "action": action}
+        if button != "left":
+            result["button"] = button
+        if clicks != 1:
+            result["clicks"] = clicks
+        if action == "scroll_to":
+            result["direction"] = direction
+            result["max_steps"] = max_steps
+        elif action in {"scroll_up", "scroll_down"}:
+            result["amount"] = amount
+        if has_point:
+            try:
+                result["x"] = max(-100000, min(100000, int(arguments["x"])))
+                result["y"] = max(-100000, min(100000, int(arguments["y"])))
+            except (TypeError, ValueError):
+                raise ValueError("The click coordinates are invalid.")
         window = _clean_window_title(arguments.get("window")) or ""
-        result = {"target": target}
         if window:
             result["window"] = window[:200]
         return name, result
@@ -853,19 +1172,29 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
             if repaired:
                 action = repaired[0]
         if not action:
-            raise ValueError("Use minimize, maximize, or restore.")
+            raise ValueError("Use minimize, maximize, restore, focus, close, list, minimize_all, snap_left, snap_right, resize, move, always_on_top, or unpin.")
+        global_actions = {"minimize_all", "restore_all", "list"}
         title = _clean_window_title(str(arguments.get("title", "")))
-        if not title and user_text:
+        if not title and user_text and action not in global_actions:
             repaired = _window_manage_from_request(user_text)
             if repaired:
                 title = repaired[1]
-        if not title:
+        if action not in global_actions and not title:
             raise ValueError("Which window should I change?")
-        if title.lower() in _GENERIC_WINDOW_TARGETS:
+        if title and title.lower() in _GENERIC_WINDOW_TARGETS and action not in global_actions:
             raise ValueError("Tell me which window by name, for example: minimize Notepad.")
-        if len(title) > 200 or re.search(r"[\x00-\x1f]", title):
+        if title and (len(title) > 200 or re.search(r"[\x00-\x1f]", title)):
             raise ValueError("The window title is invalid.")
-        return name, {"title": title, "action": action}
+        result = {"action": action}
+        if title:
+            result["title"] = title
+        for key in ("width", "height", "x", "y", "value"):
+            if arguments.get(key) is not None:
+                try:
+                    result[key] = int(arguments.get(key))
+                except (TypeError, ValueError):
+                    pass
+        return name, result
     if name == "system_control":
         action = normalize_system_action(arguments.get("action", ""), user_text)
         if not action:
@@ -944,7 +1273,7 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         return name, {"command": command, "timeout": timeout}
     if name == "browser_control":
         action = str(arguments.get("action", "")).strip().lower()
-        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down"}:
+        if action not in {"open_url", "tab_next", "tab_prev", "tab_close", "tab_new", "read_page", "click_first_result", "scroll_up", "scroll_down", "reload", "back", "forward", "fullscreen", "zoom_in", "zoom_out", "zoom_reset", "close_all", "status", "incognito", "new_chat", "detach_tab", "merge_windows", "list_windows"}:
             action = "open_url" if str(arguments.get("url", "")).strip() else "read_page"
         result = {"action": action}
         url = str(arguments.get("url", "")).strip()
@@ -1083,6 +1412,113 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         if action not in _MEDIA_ACTIONS:
             raise ValueError(f"Unsupported media action: {action!r}")
         return name, {"action": _MEDIA_ACTIONS[action]}
+    if name == "audio_control":
+        action = str(arguments.get("action", "")).strip().lower()
+        allowed = {"volume_up", "volume_down", "set_volume", "mute", "unmute",
+                   "mic_mute", "mic_unmute", "get_volume"}
+        if action not in allowed:
+            raise ValueError("Unsupported audio action.")
+        result = {"action": action}
+        if arguments.get("value") is not None:
+            try:
+                result["value"] = max(0, min(100, int(arguments.get("value"))))
+            except (TypeError, ValueError):
+                pass
+        return name, result
+    if name == "display_control":
+        action = str(arguments.get("action", "")).strip().lower()
+        allowed = {"brightness_up", "brightness_down", "set_brightness", "get_brightness",
+                   "night_mode_on", "night_mode_off", "screen_off", "screen_on"}
+        if action not in allowed:
+            raise ValueError("Unsupported display action.")
+        result = {"action": action}
+        if arguments.get("value") is not None:
+            try:
+                result["value"] = max(0, min(100, int(arguments.get("value"))))
+            except (TypeError, ValueError):
+                pass
+        return name, result
+    if name == "connectivity_control":
+        action = str(arguments.get("action", "")).strip().lower()
+        allowed = {"wifi_on", "wifi_off", "wifi_status", "bluetooth_on", "bluetooth_off",
+                   "bluetooth_status", "airplane_on", "airplane_off", "connected_devices"}
+        if action not in allowed:
+            raise ValueError("Unsupported connectivity action.")
+        return name, {"action": action}
+    if name == "weather_report":
+        city = str(arguments.get("city", "")).strip()
+        if not city:
+            raise ValueError("A city is required.")
+        return name, {"city": city}
+    if name == "notes":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"save", "read", "delete", "list"}:
+            action = "list"
+        result = {"action": action}
+        title = str(arguments.get("title", "")).strip()
+        if title:
+            result["title"] = title[:120]
+        content = arguments.get("content")
+        if content is not None:
+            result["content"] = str(content)[:4000]
+        query = str(arguments.get("query", "")).strip()
+        if query:
+            result["query"] = query[:120]
+        return name, result
+    if name == "knowledge":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"store", "recall", "forget", "list"}:
+            action = "list"
+        result = {"action": action}
+        fact = str(arguments.get("fact", "")).strip()
+        if fact:
+            result["fact"] = fact[:4000]
+        query = str(arguments.get("query", "")).strip()
+        if query:
+            result["query"] = query[:120]
+        return name, result
+    if name == "file_search":
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            raise ValueError("A search query is required.")
+        path = str(arguments.get("path", "")).strip()
+        result = {"query": query[:200]}
+        if path:
+            result["path"] = path
+        return name, result
+    if name == "navigate_screen":
+        action = str(arguments.get("action", "")).strip().lower()
+        allowed = {"scroll_up", "scroll_down", "next_tab", "prev_tab", "switch_app",
+                   "minimize_all", "close_tab"}
+        if action not in allowed:
+            raise ValueError("Unsupported navigation action.")
+        return name, {"action": action}
+    if name == "email":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"read", "send"}:
+            raise ValueError("Use read or send.")
+        result = {"action": action}
+        for key in ("to", "subject", "body", "cc", "query"):
+            val = str(arguments.get(key, "")).strip()
+            if val:
+                result[key] = val[:4000 if key == "body" else 200]
+        if arguments.get("max_results") is not None:
+            try:
+                result["max_results"] = int(arguments.get("max_results"))
+            except (TypeError, ValueError):
+                pass
+        if arguments.get("unread_only") is not None:
+            result["unread_only"] = bool(arguments.get("unread_only"))
+        return name, result
+    if name == "manage_browser_tabs":
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"new_chat", "new_tab", "detach_tab", "merge_windows"}:
+            raise ValueError("Unsupported browser tab action.")
+        result = {"action": action}
+        target = str(arguments.get("target", "")).strip()
+        if target:
+            result["target"] = target
+        return name, result
     raise ValueError(f"Unknown tool: {name!r}")
 
 
@@ -1189,12 +1625,20 @@ def fast_route(text: str) -> ToolCall | None:
             return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                             reasoning="Matched search phrase.", user_text=text)
 
-    # Browser scrolling.
-    if re.search(r"\b(?:scroll|page)\s+(up|down)\b", cleaned, re.I):
-        direction = re.search(r"\b(?:scroll|page)\s+(up|down)\b", cleaned, re.I).group(1).lower()
+    # Browser scrolling (plain up/down only; "scroll down to X" is element scrolling).
+    page_scroll = re.fullmatch(
+        r"(?:please\s+)?(?:scroll|page)\s+(up|down)(?:\s+(?:by\s+)?(\d+))?",
+        cleaned,
+        re.I,
+    )
+    if page_scroll and not re.search(r"\b(?:to|until|till|see|find)\b", cleaned, re.I):
+        direction = page_scroll.group(1).lower()
         action = "scroll_up" if direction == "up" else "scroll_down"
+        amount = int(page_scroll.group(2) or 5)
         try:
-            name, arguments = validate_call("browser_control", {"action": action, "amount": 5})
+            name, arguments = validate_call(
+                "browser_control", {"action": action, "amount": amount}
+            )
         except ValueError:
             return None
         return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
@@ -1468,38 +1912,93 @@ def fast_route(text: str) -> ToolCall | None:
             return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                             reasoning="Matched type-text phrase.", user_text=text)
 
+    again = _CLICK_AGAIN_RE.fullmatch(cleaned)
+    if again:
+        return ToolCall(
+            name="click_element",
+            arguments={"target": "", "action": "click_again"},
+            source="fast",
+            confidence=1.0,
+            reasoning="Matched repeat-click phrase.",
+            user_text=text,
+        )
+
+    scroll_to = _SCROLL_TO_RE.fullmatch(cleaned)
+    if scroll_to:
+        direction = scroll_to.group(1).lower()
+        dest = _clean_click_target(scroll_to.group(2))
+        if dest:
+            try:
+                name, arguments = validate_call(
+                    "click_element",
+                    {"target": dest, "action": "scroll_to", "direction": direction},
+                )
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                            reasoning="Matched scroll-to-element phrase.", user_text=text)
+
     cursor_move = _CURSOR_MOVE_RE.fullmatch(cleaned)
     if cursor_move:
         dest = cursor_move.group(1).strip()
-        return ToolCall(name="click_element", arguments={"target": f"move cursor to {dest}"},
-                        source="fast", confidence=1.0, reasoning="Matched cursor movement.", user_text=text)
+        try:
+            name, arguments = validate_call(
+                "click_element", {"target": dest, "action": "move"}
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched cursor movement.", user_text=text)
 
     right_click = _RIGHT_CLICK_RE.fullmatch(cleaned)
     if right_click:
         target = (right_click.group(1) or "").strip()
-        arg = f"right click {target}".strip() if target else "right click"
-        return ToolCall(name="click_element", arguments={"target": arg},
-                        source="fast", confidence=1.0, reasoning="Matched right-click phrase.", user_text=text)
+        try:
+            name, arguments = validate_call(
+                "click_element", {"target": target, "action": "right_click"}
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched right-click phrase.", user_text=text)
 
     double_click = _DOUBLE_CLICK_RE.fullmatch(cleaned)
     if double_click:
         target = (double_click.group(1) or "").strip()
-        arg = f"double click {target}".strip() if target else "double click"
-        return ToolCall(name="click_element", arguments={"target": arg},
-                        source="fast", confidence=1.0, reasoning="Matched double-click phrase.", user_text=text)
+        try:
+            name, arguments = validate_call(
+                "click_element", {"target": target, "action": "double_click"}
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched double-click phrase.", user_text=text)
 
     scrolled = _SCROLL_RE.fullmatch(cleaned)
     if scrolled:
         direction = scrolled.group(1).lower()
-        amount = scrolled.group(2) or "5"
-        return ToolCall(name="click_element", arguments={"target": f"scroll {direction} {amount}"},
-                        source="fast", confidence=1.0, reasoning="Matched scroll phrase.", user_text=text)
+        amount = int(scrolled.group(2) or 5)
+        try:
+            name, arguments = validate_call(
+                "click_element",
+                {"target": "", "action": f"scroll_{direction}", "amount": amount},
+            )
+        except ValueError:
+            return None
+        return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
+                        reasoning="Matched scroll phrase.", user_text=text)
 
     clicked = _CLICK_RE.fullmatch(original)
     if clicked:
         target = _clean_click_target(clicked.group(1))
         if target and len(target) <= 200:
-            return ToolCall(name="click_element", arguments={"target": target}, source="fast",
+            try:
+                name, arguments = validate_call(
+                    "click_element", {"target": target, "action": "click"}
+                )
+            except ValueError:
+                return None
+            return ToolCall(name=name, arguments=arguments, source="fast",
                             confidence=1.0, reasoning="Matched click phrase.", user_text=text)
 
     return None
@@ -1562,7 +2061,10 @@ def badge_text(call: ToolCall) -> str:
     elif call.name == "type_text":
         detail = str(call.arguments.get("text", ""))
     elif call.name == "click_element":
+        action = str(call.arguments.get("action", "") or "")
         detail = str(call.arguments.get("target", ""))
+        if action and action != "click":
+            detail = f"{action.replace('_', ' ')} {detail}".strip()
     elif call.name == "press_hotkey":
         detail = "+".join(str(k) for k in call.arguments.get("keys", []))
     elif call.name == "control_media":
@@ -1619,7 +2121,22 @@ def describe_call(call: ToolCall) -> str:
         short = text if len(text) <= 60 else text[:57] + "..."
         return f"Typing \"{short}\""
     if call.name == "click_element":
-        return f"Clicking {call.arguments.get('target', 'the element')}"
+        action = str(call.arguments.get("action", "click") or "click")
+        target = str(call.arguments.get("target", "")) or "the element"
+        if action == "click_again":
+            return "Clicking the previous target again"
+        if action == "scroll_to":
+            direction = str(call.arguments.get("direction", "down") or "down")
+            return f"Scrolling {direction} to {target}"
+        if action in {"scroll_up", "scroll_down"}:
+            return f"Scrolling {action.split('_', 1)[1]}"
+        if action == "move":
+            return f"Moving the cursor to {target}"
+        if action == "right_click":
+            return f"Right-clicking {target}"
+        if action == "double_click":
+            return f"Double-clicking {target}"
+        return f"Clicking {target}"
     if call.name == "press_hotkey":
         return "Pressing " + "+".join(str(k) for k in call.arguments.get("keys", []))
     if call.name == "take_screenshot":

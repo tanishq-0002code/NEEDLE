@@ -15,5 +15,14 @@ requests==2.32.5
 srt==3.5.3
 tqdm==4.67.3
 
+# Offline screen OCR (Windows.Media.Ocr) - no vision model required.
+winrt-runtime==4.1.0
+winrt-Windows.Foundation==4!10.0.28000.2957
+winrt-Windows.Foundation.Collections==4!10.0.28000.2957
+winrt-Windows.Globalization==4!10.0.28000.2957
+winrt-Windows.Graphics.Imaging==4!10.0.28000.2957
+winrt-Windows.Media.Ocr==4!10.0.28000.2957
+winrt-Windows.Storage.Streams==4!10.0.28000.2957
+
 # Build-time only (not required on the target machine)
 pyinstaller==6.22.3

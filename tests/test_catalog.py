@@ -60,6 +60,29 @@ class FastRouteTests(unittest.TestCase):
         self.assertIsNotNone(call)
         self.assertEqual(call.name, "click_element")
         self.assertEqual(call.arguments["target"], "save")
+        self.assertEqual(call.arguments["action"], "click")
+
+    def test_click_again(self) -> None:
+        call = fast_route("click it again")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "click_element")
+        self.assertEqual(call.arguments["action"], "click_again")
+        self.assertEqual(call.arguments["target"], "")
+
+    def test_scroll_to_element(self) -> None:
+        call = fast_route("scroll down until you see Settings")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "click_element")
+        self.assertEqual(call.arguments["action"], "scroll_to")
+        self.assertEqual(call.arguments["direction"], "down")
+        self.assertEqual(call.arguments["target"], "settings")
+
+    def test_right_click_is_structured(self) -> None:
+        call = fast_route("right click the desktop")
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "click_element")
+        self.assertEqual(call.arguments["action"], "right_click")
+        self.assertEqual(call.arguments["target"], "desktop")
 
     def test_close_application(self) -> None:
         call = fast_route("close Chrome")
@@ -199,7 +222,7 @@ class FastRouteTests(unittest.TestCase):
 
 class CatalogTests(unittest.TestCase):
     def test_tools_are_declared(self) -> None:
-        self.assertEqual(len(TOOL_SCHEMAS), 21)
+        self.assertEqual(len(TOOL_SCHEMAS), 31)
         self.assertEqual(
             ALLOWED_TOOLS,
             {
@@ -224,6 +247,16 @@ class CatalogTests(unittest.TestCase):
                 "macro",
                 "shortcut",
                 "send_message",
+                "audio_control",
+                "display_control",
+                "connectivity_control",
+                "weather_report",
+                "notes",
+                "knowledge",
+                "file_search",
+                "navigate_screen",
+                "email",
+                "manage_browser_tabs",
             },
         )
 
@@ -327,6 +360,38 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("shut down", destructive_description(call).lower())
         call = fast_route("close Chrome")
         self.assertFalse(is_destructive(call))
+
+    def test_click_action_validation(self) -> None:
+        name, arguments = validate_call(
+            "click_element", {"target": "Save", "action": "double-click"}
+        )
+        self.assertEqual(name, "click_element")
+        self.assertEqual(arguments["action"], "double_click")
+        self.assertEqual(arguments["target"], "Save")
+        self.assertEqual(arguments["clicks"], 2)
+
+        name, arguments = validate_call(
+            "click_element", {"target": "right click Save"}
+        )
+        self.assertEqual(arguments["action"], "right_click")
+        self.assertEqual(arguments["target"], "Save")
+        self.assertEqual(arguments["button"], "right")
+
+        name, arguments = validate_call(
+            "click_element", {"target": "", "action": "click_again"}
+        )
+        self.assertEqual(arguments["action"], "click_again")
+        self.assertEqual(arguments["target"], "")
+
+        name, arguments = validate_call(
+            "click_element", {"target": "", "x": 120, "y": 240}
+        )
+        self.assertEqual(arguments["x"], 120)
+        self.assertEqual(arguments["y"], 240)
+
+    def test_click_requires_target_unless_repeat_or_coordinates(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_call("click_element", {"target": ""})
 
 
 class EnvelopeTests(unittest.TestCase):

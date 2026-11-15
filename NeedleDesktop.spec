@@ -91,6 +91,16 @@ hiddenimports = [
     "PyQt6.QtWidgets",
     "needle_assistant.overlay",
     "needle_assistant.waveform",
+    # Offline Windows OCR (winrt) used by vision.py.
+    "winrt.runtime",
+    "winrt.windows.foundation",
+    "winrt.windows.foundation.collections",
+    "winrt.windows.globalization",
+    "winrt.windows.graphics.imaging",
+    "winrt.windows.media.ocr",
+    "winrt.windows.storage.streams",
+    "pycaw",
+    "screen_brightness_control",
 ]
 
 excludes = [

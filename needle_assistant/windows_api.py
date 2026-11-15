@@ -151,6 +151,22 @@ def enumerate_windows() -> list[WindowInfo]:
     return windows
 
 
+def visible_windows_for_pid(pid: int) -> list[int]:
+    """Visible top-level windows for a process, including untitled popups/menus."""
+    handles: list[int] = []
+
+    @WNDENUMPROC
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if get_window_pid(hwnd) == pid:
+            handles.append(int(hwnd))
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return handles
+
+
 def find_window_for_pid(pid: int) -> int:
     best = 0
     best_area = 0
