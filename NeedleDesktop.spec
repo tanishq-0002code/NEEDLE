@@ -66,6 +66,7 @@ hiddenimports = [
     "requests",
     "certifi",
     "needle_assistant.telegram_bot",
+    "needle_assistant.pw_parser",
     "sounddevice",
     "_sounddevice",
     "comtypes",

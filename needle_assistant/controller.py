@@ -44,6 +44,7 @@ class AssistantController(QObject):
     plan_done = pyqtSignal(bool, str, int)
     scheduled_fire = pyqtSignal(str, object)
     notify = pyqtSignal(str, str)
+    study_notice = pyqtSignal(str, bool)
     status_changed = pyqtSignal(str)
     config_changed = pyqtSignal(object)
     refresh_status = pyqtSignal()
@@ -112,8 +113,15 @@ class AssistantController(QObject):
         self.plan_step_done.connect(self.on_plan_step_done)
         self.plan_done.connect(self.on_plan_done)
         self.scheduled_fire.connect(self._handle_scheduled_fire)
+        self.study_notice.connect(self.on_study_notice)
         self.refresh_status.connect(self._refresh_settings_status)
         self.confirm_needed.connect(self._on_confirm_needed)
+        try:
+            self.automation.set_study_notifier(
+                lambda message, is_error: self.study_notice.emit(message, is_error)
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ startup
     def start(self) -> None:
@@ -634,6 +642,7 @@ class AssistantController(QObject):
         total = len(steps)
         overall_success = True
         final_message = f"Completed {total} step(s)."
+        last_result_message = ""
         for index, step_text in enumerate(steps, 1):
             if session != self._session:
                 return
@@ -685,10 +694,15 @@ class AssistantController(QObject):
             if inverse is not None:
                 self.undo.record(inverse)
             self.plan_step_done.emit(call, result, index, total)
+            last_result_message = result.message
             if not result.success:
                 final_message = f"Step {index} failed: {result.message}"
                 overall_success = False
                 break
+        if overall_success and total == 1 and last_result_message:
+            # Study/report steps produce useful text; don't replace it with
+            # a generic "Completed 1 step(s)" summary.
+            final_message = last_result_message
         if overall_success:
             self.automation.set_last_plan_steps(steps)
             try:
@@ -780,7 +794,7 @@ class AssistantController(QObject):
         else:
             self.overlay.show_error(message)
             self._play_sound("error.wav")
-        self.overlay.hide_after(1200 if success else 3200)
+        self.overlay.hide_after(self._result_hide_ms(message, success))
         self._active = False
         try:
             self.undo.clear() if not success else None
@@ -843,12 +857,35 @@ class AssistantController(QObject):
             log.debug("Could not show the confirmation dialog.", exc_info=True)
             return False
 
+    @staticmethod
+    def _result_hide_ms(message: str, success: bool) -> int:
+        if not success:
+            return 3200
+        return max(1400, min(9000, 1000 + len(str(message or "")) * 40))
+
+    def on_study_notice(self, message: str, is_error: bool) -> None:
+        if self._quitting:
+            return
+        text = str(message or "").strip()
+        if not text:
+            return
+        if is_error:
+            self.overlay.show_error(text)
+            self._play_sound("error.wav")
+        else:
+            self.overlay.show_result(
+                ExecutionResult(True, text, "study_mode"), None, "needle"
+            )
+            self._play_sound("done.wav")
+        self.overlay.hide_after(self._result_hide_ms(text, not is_error))
+        self.notify.emit("Class is live" if not is_error else "Study watch", text)
+
     def on_execution_ready(self, result: ExecutionResult, call: ToolCall, session: int) -> None:
         if session != self._session:
             log.info("Discarding stale execution result for %s.", call.name)
             return
         self.overlay.show_result(result, call, call.source)
-        self.overlay.hide_after(1200 if result.success else 2800)
+        self.overlay.hide_after(self._result_hide_ms(result.message, result.success))
         self._play_sound("done.wav" if result.success else "error.wav")
         if not result.success:
             self.notify.emit("Needle couldn't finish", result.message)
@@ -1283,6 +1320,10 @@ class AssistantController(QObject):
             return
         self._quitting = True
         log.info("Shutting down Needle Desktop.")
+        try:
+            self.automation.stop_study_watcher()
+        except Exception:
+            pass
         try:
             self._stop_telegram("Off")
         except Exception:

@@ -13,7 +13,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import psutil
 
@@ -417,6 +417,30 @@ class DesktopAutomation:
         self._last_browser_hwnd = 0
         self._last_click: dict[str, Any] | None = None
         self._last_grab_origin: tuple[int, int] = (0, 0)
+        self._study_watcher: Any = None
+        self._study_notify: Callable[[str, bool], None] | None = None
+
+    def set_study_notifier(self, notifier: Callable[[str, bool], None] | None) -> None:
+        """Register the controller callback used for background live-class notices."""
+        self._study_notify = notifier
+
+    def _emit_study_notice(self, message: str, is_error: bool = False) -> None:
+        callback = self._study_notify
+        if callback is None:
+            return
+        try:
+            callback(str(message), bool(is_error))
+        except Exception:
+            pass
+
+    def stop_study_watcher(self) -> None:
+        watcher = self._study_watcher
+        self._study_watcher = None
+        if watcher is not None:
+            try:
+                watcher.stop()
+            except Exception:
+                pass
 
     def _prepare_gui(self) -> None:
         if self._gui_ready:
@@ -610,6 +634,14 @@ class DesktopAutomation:
                     return self._manage_browser_tabs(
                         str(call.arguments.get("action", "")),
                         str(call.arguments.get("target", "")),
+                    )
+                if call.name == "study_mode":
+                    return self._study_mode(
+                        str(call.arguments.get("mode", "open")),
+                        str(call.arguments.get("url", "")),
+                        str(call.arguments.get("subject", "")),
+                        str(call.arguments.get("kind", "auto")),
+                        call.arguments.get("timeout", 7200),
                     )
                 return ExecutionResult(False, f"Unknown action: {call.name}", call.name)
             except AutomationError as exc:
@@ -2658,6 +2690,271 @@ class DesktopAutomation:
             return ExecutionResult(True, f"Snapped {len(wins)} windows side by side.", "manage_browser_tabs")
         raise AutomationError(f"Unknown browser tab action: {action}")
 
+    def _prepare_for_study(self) -> None:
+        """Close visible user apps, keeping Needle, Explorer, and browsers alive.
+
+        Only windows with a visible title are closed, and only via WM_CLOSE, so
+        shell processes and background services are never killed. Apps with
+        unsaved work can still show their normal save prompt.
+        """
+        protected = {
+            "system", "registry", "memory compression", "idle", "csrss.exe",
+            "winlogon.exe", "services.exe", "lsass.exe", "smss.exe", "wininit.exe",
+            "dwm.exe", "sihost.exe", "taskhostw.exe", "ctfmon.exe",
+            "explorer.exe", "needledesktop.exe", "needle.exe", "msedge.exe",
+            "chrome.exe", "firefox.exe", "brave.exe", "opera.exe",
+            "python.exe", "pythonw.exe", "lockapp.exe", "logonui.exe",
+            "textinputhost.exe", "startmenuexperiencehost.exe",
+            "shellexperiencehost.exe", "searchhost.exe", "searchui.exe",
+            "runtimebroker.exe", "securityhealthsystray.exe",
+            "securityhealthservice.exe", "msmpeng.exe", "audiodg.exe",
+            "spoolsv.exe",
+        }
+        own_pid = os.getpid()
+        closed = 0
+        for info in win.enumerate_windows():
+            try:
+                if info.pid == own_pid:
+                    continue
+                name = (psutil.Process(info.pid).name() or "").lower()
+            except Exception:
+                continue
+            if not name or name in protected or name in _PROTECTED_PROCESSES:
+                continue
+            title = info.title.strip().lower()
+            if not title or title in {"program manager", "start", "search"}:
+                continue
+            try:
+                user32.PostMessageW(info.hwnd, WM_CLOSE, 0, 0)
+                closed += 1
+            except Exception:
+                pass
+        if closed:
+            time.sleep(1.2)
+
+    def _study_mode(
+        self,
+        mode: str,
+        url: str = "",
+        subject: str = "",
+        kind: str = "auto",
+        timeout: Any = 7200,
+    ) -> ExecutionResult:
+        from . import pw_parser
+
+        mode = (mode or "open").strip().lower()
+        if mode not in {
+            "open", "prepare", "status", "open_class", "wait_live",
+            "schedule", "reload", "stop_watch",
+        }:
+            mode = "open"
+        url = (url or "").strip() or pw_parser.STUDY_URL
+        subject = (subject or "").strip()
+        kind = (kind or "auto").strip().lower()
+        try:
+            timeout_value = int(timeout)
+        except (TypeError, ValueError):
+            timeout_value = 7200
+        timeout_value = max(60, min(24 * 60 * 60, timeout_value))
+
+        if mode == "stop_watch":
+            if self._study_watcher is not None:
+                self.stop_study_watcher()
+                return ExecutionResult(
+                    True, "Stopped watching for the live class.", "study_mode"
+                )
+            return ExecutionResult(True, "No live-class watch is running.", "study_mode")
+
+        if mode == "wait_live":
+            return self._study_wait_live(subject, timeout_value)
+
+        if mode == "prepare":
+            self._prepare_for_study()
+
+        try:
+            if mode == "schedule":
+                _hwnd, _controls, snapshot = pw_parser.open_schedule_page()
+                return ExecutionResult(
+                    True, pw_parser.format_schedule(snapshot), "study_mode"
+                )
+            if mode == "reload":
+                _hwnd, _controls, snapshot = pw_parser.reload_study_page()
+                return ExecutionResult(
+                    True,
+                    "Reloaded the study page. " + pw_parser.format_status(snapshot),
+                    "study_mode",
+                )
+            hwnd, _controls, snapshot = pw_parser.ensure_study_page(url=url)
+        except Exception as exc:
+            raise AutomationError(str(exc)) from exc
+
+        if mode == "open_class":
+            return self._study_open_class(hwnd, snapshot, subject, kind)
+
+        message = pw_parser.format_status(snapshot)
+        if mode == "status":
+            return ExecutionResult(True, message, "study_mode")
+        prefix = "Ready for study. " if mode == "prepare" else "Opened the study dashboard. "
+        return ExecutionResult(True, prefix + message, "study_mode")
+
+    def _study_open_class(
+        self,
+        hwnd: int,
+        snapshot: Any,
+        subject: str,
+        kind: str,
+    ) -> ExecutionResult:
+        from . import pw_parser
+
+        event = pw_parser.find_event(snapshot, subject, kind)
+
+        if kind == "recorded":
+            if not subject:
+                return ExecutionResult(
+                    False,
+                    "Which subject's recording should I open?",
+                    "study_mode",
+                )
+            # A real recorded/completed card is directly playable. An upcoming
+            # "recorded lecture" card is still a future class, so prefer the
+            # All Classes -> chapter -> Watch Again path for recordings.
+            if event is not None and event.status in {"recorded", "completed"}:
+                opened, message = pw_parser.activate_event(hwnd, event)
+                if opened:
+                    return ExecutionResult(True, message, "study_mode")
+            try:
+                opened, message = pw_parser.open_recorded_subject(subject)
+            except Exception as exc:
+                opened, message = False, str(exc)
+            if opened:
+                return ExecutionResult(True, message, "study_mode")
+            if event is not None:
+                opened2, message2 = pw_parser.activate_event(hwnd, event)
+                if opened2:
+                    return ExecutionResult(True, message2, "study_mode")
+            return ExecutionResult(
+                False,
+                message + " " + pw_parser.format_status(snapshot),
+                "study_mode",
+            )
+
+        if event is not None:
+            opened, message = pw_parser.activate_event(hwnd, event)
+            if opened:
+                return ExecutionResult(True, message, "study_mode")
+            return ExecutionResult(
+                False,
+                message + " " + pw_parser.format_status(snapshot),
+                "study_mode",
+            )
+
+        if kind in {"class", "lecture", "auto"}:
+            try:
+                hwnd2, _controls2, schedule = pw_parser.open_schedule_page()
+                schedule_event = pw_parser.find_event(schedule, subject, kind)
+            except Exception:
+                hwnd2, schedule_event = 0, None
+            if schedule_event is not None:
+                opened, message = pw_parser.activate_event(hwnd2, schedule_event)
+                if opened:
+                    return ExecutionResult(True, message, "study_mode")
+
+        if kind == "live":
+            return ExecutionResult(
+                True,
+                "No class is live right now. "
+                + pw_parser.format_status(snapshot)
+                + " Say 'open the class as it turns live' and I'll wait for it.",
+                "study_mode",
+            )
+
+        if subject:
+            message = (
+                f"I couldn't find a {subject} {kind if kind != 'auto' else 'class'} "
+                f"on the dashboard. " + pw_parser.format_status(snapshot)
+            )
+        else:
+            message = (
+                "I couldn't find a class to open. "
+                + pw_parser.format_status(snapshot)
+            )
+        return ExecutionResult(True, message, "study_mode")
+
+    def _study_wait_live(self, subject: str, timeout: int) -> ExecutionResult:
+        from . import pw_parser
+
+        self.stop_study_watcher()
+        try:
+            hwnd, _controls, snapshot = pw_parser.ensure_study_page()
+        except Exception as exc:
+            raise AutomationError(str(exc)) from exc
+
+        live = pw_parser.find_event(snapshot, subject, "live")
+        if live is not None:
+            opened, message = pw_parser.activate_event(hwnd, live)
+            if opened:
+                return ExecutionResult(
+                    True, "That class is already live. " + message, "study_mode"
+                )
+
+        target_subject = subject
+        target_note = ""
+        if not target_subject:
+            if snapshot.live:
+                target_subject = snapshot.live[0].subject
+            elif snapshot.upcoming:
+                target_subject = snapshot.upcoming[0].subject
+                when = snapshot.upcoming[0].time_text
+                target_note = (
+                    f" The next class is {pw_parser._event_line(snapshot.upcoming[0])}."
+                    if snapshot.upcoming[0].title
+                    else ""
+                )
+                if when and when not in target_note:
+                    target_note += f" It starts at {when}."
+            else:
+                return ExecutionResult(
+                    True,
+                    "I couldn't find an upcoming class to wait for. "
+                    + pw_parser.format_status(snapshot),
+                    "study_mode",
+                )
+
+        def on_open(event: Any, message: str) -> None:
+            label = pw_parser._event_line(event)
+            self._emit_study_notice(
+                f"Your class is live. {label}. {message}", False
+            )
+
+        def on_timeout(_last_error: str) -> None:
+            self._emit_study_notice(
+                "I stopped waiting: no matching class went live within the time limit.",
+                True,
+            )
+
+        def on_error(message: str) -> None:
+            self._emit_study_notice(
+                "I couldn't check the study page: " + message, True
+            )
+
+        watcher = pw_parser.StudyWatcher(
+            subject=target_subject,
+            kind="live",
+            timeout=float(timeout),
+            on_open=on_open,
+            on_timeout=on_timeout,
+            on_error=on_error,
+        )
+        watcher.start()
+        self._study_watcher = watcher
+        label = target_subject.title() if target_subject else "the next class"
+        return ExecutionResult(
+            True,
+            f"I'll watch for {label} and open it as soon as it goes live.{target_note} "
+            f"Say 'stop watching' to cancel.",
+            "study_mode",
+        )
+
     def _clipboard(self, action: str, text: str = "") -> ExecutionResult:
         action = action.strip().lower()
         if action not in {"get", "set"}:
@@ -3018,6 +3315,8 @@ class DesktopAutomation:
                     raise AutomationError(f"Could not open the URL in {display_name}: {exc}") from exc
                 self._remember_browser(Path(exe_path).name.lower())
                 return ExecutionResult(True, f"Opened {url} in {display_name}.", "browser_control")
+            if requested:
+                raise AutomationError(f"{display_name or requested.title()} was not found on this system.")
             try:
                 os.startfile(url)  # type: ignore[attr-defined]
             except OSError as exc:

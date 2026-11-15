@@ -498,6 +498,39 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["action"],
         },
     },
+    {
+        "name": "study_mode",
+        "description": (
+            "Physics Wallah study dashboard. Open/prepare the study page, read live and "
+            "upcoming classes, open a subject class or recording, show the weekly schedule, "
+            "reload the study tab, or wait until a class goes live."
+        ),
+        "triggers": [
+            r"\b(?:study time|study mode|ready for study|system ready for study|study dashboard|study status)\b",
+            r"\b(?:pw|physics wallah|pw\.live|live class|classes are live|class is live)\b",
+            r"\b(?:weekly schedule|study schedule|study timetable|timetable)\b",
+            r"\b(?:open|join|watch)\b.*\b(?:class|lecture|recording)\b",
+        ],
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": [
+                        "open", "prepare", "status", "open_class", "wait_live",
+                        "schedule", "reload", "stop_watch",
+                    ],
+                },
+                "url": {"type": "string"},
+                "subject": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["auto", "live", "upcoming", "recorded", "completed", "class", "lecture"],
+                },
+                "timeout": {"type": "integer"},
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = "device: Windows desktop"
@@ -600,6 +633,109 @@ _SLEEP_RE = re.compile(
     r"|sleep(?:\s+(?:the\s+)?(?:computer|pc|machine|laptop))?"
     r"|go\s+to\s+sleep)[.!?]*$",
     re.I,
+)
+
+_STUDY_SUBJECT = (
+    r"(?:physical\s+chem(?:istry)?|organic\s+chem(?:istry)?|"
+    r"inorganic\s+chem(?:istry)?|maths?|mathematics|physics|phy|chemistry|chem|"
+    r"biology|bio|english|statistics|stats|reasoning|computer\s+science|"
+    r"social\s+science|sst|science|hindi|economics|accountancy|"
+    r"business\s+studies)"
+)
+_STUDY_SUBJECT_ALIASES = {
+    "math": "maths",
+    "mathematics": "maths",
+    "phy": "physics",
+    "chem": "chemistry",
+    "physical chemistry": "chemistry",
+    "physical chem": "chemistry",
+    "organic chemistry": "chemistry",
+    "organic chem": "chemistry",
+    "inorganic chemistry": "chemistry",
+    "inorganic chem": "chemistry",
+    "bio": "biology",
+    "eng": "english",
+    "stats": "statistics",
+}
+_STUDY_STATUS_RES = (
+    re.compile(
+        r"^(?:what|which)\s+(?:class|lecture|subject|course|lesson)\s+(?:is|are)\s+"
+        r"(?:live|going\s+on|running|happening|playing|streaming)"
+        r"(?:\s+(?:right\s+now|now|currently|today))?[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:what|which)\s+(?:classes|lectures)\s+(?:are|is)\s+"
+        r"(?:live|going\s+on|running|happening)"
+        r"(?:\s+(?:right\s+now|now|currently|today))?[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:is|are)\s+(?:there\s+)?(?:a\s+|an\s+|any\s+|my\s+)?"
+        rf"(?:(?:the\s+)?(?:{_STUDY_SUBJECT})\s+)?(?:the\s+)?"
+        r"(?:class|lecture|classes|lectures)\s+"
+        r"(?:live|going\s+on|running|happening)"
+        r"(?:\s+(?:right\s+now|now|currently|today))?[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:what(?:'s|\s+is)\s+live(?:\s+(?:right\s+now|now|currently))?"
+        r"|what\s+is\s+currently\s+live)[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:show|check|read|open|display|tell\s+me)\s+(?:my\s+)?"
+        r"(?:study\s+)?(?:dashboard|status)[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:(?:what(?:'s|\s+is)\s+(?:on\s+)?)|(?:check|show)\s+)"
+        r"(?:my\s+)?(?:study\s+)?(?:schedule|timetable|classes|lectures)[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:what|which)\s+(?:classes|lectures)\s+"
+        r"(?:do\s+i\s+have|are\s+there|are\s+scheduled)"
+        r"(?:\s+(?:today|now|next))?[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:what|which)\s+(?:are|were)\s+(?:my\s+|all\s+|the\s+)?"
+        r"(?:classes|lectures|lessons)(?:\s+(?:today|now|next))?[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:show|check|list|read|tell\s+me)\s+(?:my\s+)?(?:study\s+)?"
+        r"(?:classes|lectures)(?:\s+(?:today|now|next))?[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:study|class|lecture)\s+(?:status|dashboard|update|schedule)[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:any\s+live\s+class|live\s+class\s+now|currently\s+live"
+        r"|what\s+class\s+is\s+live)[.!?]*$",
+        re.I,
+    ),
+)
+_STUDY_SCHEDULE_RES = (
+    re.compile(
+        r"^(?:open|show|display|view|check|see)\s+(?:the\s+)?(?:my\s+)?"
+        r"(?:full|weekly|complete|entire)\s+(?:study\s+)?"
+        r"(?:schedule|timetable)[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:open|display|view)\s+(?:the\s+)?(?:my\s+)?(?:study\s+)?"
+        r"(?:schedule|timetable)[.!?]*$",
+        re.I,
+    ),
+    re.compile(
+        r"^(?:the\s+)?(?:full|weekly|complete)\s+(?:study\s+)?"
+        r"(?:schedule|timetable)[.!?]*$",
+        re.I,
+    ),
 )
 
 _HOTKEY_PHRASES = {
@@ -1519,6 +1655,46 @@ def validate_call(name: str, arguments: dict[str, Any] | None,
         if target:
             result["target"] = target
         return name, result
+    if name == "study_mode":
+        mode = str(arguments.get("mode", "open")).strip().lower()
+        if mode not in {
+            "open", "prepare", "status", "open_class", "wait_live",
+            "schedule", "reload", "stop_watch",
+        }:
+            mode = "open"
+        result: dict[str, Any] = {"mode": mode}
+        url = str(arguments.get("url", "")).strip()
+        if url:
+            result["url"] = url
+        subject = str(arguments.get("subject", "")).strip().lower()
+        if subject:
+            subject = " ".join(subject.split())
+            subject = _STUDY_SUBJECT_ALIASES.get(subject, subject)
+            result["subject"] = subject[:80]
+        kind = str(arguments.get("kind", "auto")).strip().lower()
+        kind_aliases = {
+            "recording": "recorded",
+            "recorded": "recorded",
+            "video": "recorded",
+            "replay": "recorded",
+            "stream": "live",
+            "join": "live",
+            "next": "upcoming",
+            "finished": "completed",
+            "session": "class",
+            "course": "class",
+            "lecture": "lecture",
+        }
+        kind = kind_aliases.get(kind, kind)
+        if kind not in {"auto", "live", "upcoming", "recorded", "completed", "class", "lecture"}:
+            kind = "auto"
+        result["kind"] = kind
+        try:
+            timeout = int(arguments.get("timeout", 7200))
+        except (TypeError, ValueError):
+            timeout = 7200
+        result["timeout"] = max(60, min(24 * 60 * 60, timeout))
+        return name, result
     raise ValueError(f"Unknown tool: {name!r}")
 
 
@@ -1550,6 +1726,186 @@ def fast_route(text: str) -> ToolCall | None:
             return None
         return ToolCall(name=name, arguments=arguments, source="fast", confidence=1.0,
                         reasoning="Matched read-screen phrase.", user_text=text)
+
+    def _study(
+        mode: str,
+        subject: str = "",
+        kind: str = "auto",
+        timeout: int | None = None,
+    ) -> ToolCall:
+        payload: dict[str, Any] = {"mode": mode, "kind": kind}
+        if subject:
+            payload["subject"] = subject
+        if timeout:
+            payload["timeout"] = timeout
+        tool_name, arguments = validate_call("study_mode", payload)
+        return ToolCall(
+            name=tool_name,
+            arguments=arguments,
+            source="fast",
+            confidence=1.0,
+            reasoning=f"Matched study {mode} phrase.",
+            user_text=text,
+        )
+
+    lowered = cleaned.lower()
+
+    # Reload/refresh: instant F5 in the current browser tab, or the study tab.
+    if re.fullmatch(
+        r"(?:reload|refresh)\s+(?:the\s+|my\s+)?"
+        r"(?:study|pw|pw\.live|physics\s+wallah|dashboard)"
+        r"(?:\s+(?:study\s+)?(?:page|tab|dashboard|site|website))?[.!?]*",
+        cleaned,
+        re.I,
+    ):
+        return _study("reload")
+    if re.fullmatch(
+        r"(?:reload|refresh)(?:\s+(?:the|this|current|my))*"
+        r"(?:\s+(?:page|tab|browser|window|website|site|screen|"
+        r"edge|chrome|firefox|brave|opera))*[.!?]*",
+        cleaned,
+        re.I,
+    ):
+        tool_name, arguments = validate_call("browser_control", {"action": "reload"})
+        return ToolCall(
+            name=tool_name,
+            arguments=arguments,
+            source="fast",
+            confidence=1.0,
+            reasoning="Matched reload phrase.",
+            user_text=text,
+        )
+
+    if re.fullmatch(
+        r"(?:stop|cancel|end)\s+(?:the\s+)?(?:class\s+)?"
+        r"(?:watch|watching|waiting|wait|live\s+watch|live\s+wait)"
+        r"(?:\s+for\s+(?:the\s+)?class)?[.!?]*",
+        cleaned,
+        re.I,
+    ):
+        return _study("stop_watch")
+
+    wait_live = re.fullmatch(
+        rf"(?:open|join|start|watch|play)\s+(?:the\s+)?"
+        rf"(?:(?P<subject>{_STUDY_SUBJECT})\s+)?"
+        r"(?:class|lecture|stream|session|lesson)\s+"
+        r"(?:as\s+(?:soon\s+as\s+)?it\s+(?:turns|goes|is)\s+live"
+        r"|when\s+it\s+(?:turns|goes|is|starts)\s+live"
+        r"|once\s+it\s+(?:turns|goes|is|starts)\s+live)[.!?]*",
+        cleaned,
+        re.I,
+    )
+    if wait_live is None:
+        wait_live = re.fullmatch(
+            rf"(?:wait|keep\s+checking|watch)\s+(?:for\s+)?(?:the\s+)?"
+            rf"(?:(?P<subject>{_STUDY_SUBJECT})\s+)?"
+            r"(?:class|lecture|stream|session|lesson)\s+"
+            r"(?:to\s+(?:go|turn|be)\s+live"
+            r"|until\s+(?:it|the\s+class)\s+(?:goes|turns|is)\s+live)[.!?]*",
+            cleaned,
+            re.I,
+        )
+    if wait_live is None:
+        wait_live = re.fullmatch(
+            rf"(?:wait|keep\s+checking|watch)\s+(?:until|till)\s+(?:the\s+)?"
+            rf"(?:(?P<subject>{_STUDY_SUBJECT})\s+)?"
+            r"(?:class|lecture|stream|session|lesson)\s+"
+            r"(?:goes|turns|is|starts)\s+live[.!?]*",
+            cleaned,
+            re.I,
+        )
+    if wait_live is not None:
+        return _study(
+            "wait_live",
+            subject=(wait_live.groupdict().get("subject") or ""),
+            kind="live",
+        )
+
+    if any(pattern.fullmatch(cleaned) for pattern in _STUDY_SCHEDULE_RES):
+        return _study("schedule")
+
+    if any(pattern.fullmatch(cleaned) for pattern in _STUDY_STATUS_RES):
+        return _study("status")
+
+    open_subject = re.fullmatch(
+        rf"(?:open|join|start|watch|play|resume|continue)\s+(?:the\s+)?"
+        rf"(?:(?P<qualifier>live|recorded)\s+)?(?:today'?s\s+|today\s+)?"
+        rf"(?P<subject>{_STUDY_SUBJECT})\s+(?:live\s+)?"
+        rf"(?P<kind>class|lecture|recording|recorded\s+lecture|video|stream|session|lesson)"
+        r"(?:\s+(?:today|now|live|for\s+me|please))?[.!?]*",
+        cleaned,
+        re.I,
+    )
+    if open_subject is not None:
+        qualifier = (open_subject.group("qualifier") or "").lower()
+        kind_word = open_subject.group("kind").lower()
+        if "record" in kind_word or "video" in kind_word or qualifier == "recorded":
+            kind = "recorded"
+        elif "stream" in kind_word or qualifier == "live" or " live " in f" {cleaned} ":
+            kind = "live"
+        else:
+            kind = "class"
+        return _study(
+            "open_class",
+            subject=open_subject.group("subject"),
+            kind=kind,
+        )
+
+    open_kind_subject = re.fullmatch(
+        rf"(?:open|join|start|watch|play|resume|continue)\s+(?:the\s+)?"
+        rf"(?P<kind>class|lecture|recording|recorded\s+lecture|video|stream|session|lesson)\s+"
+        rf"(?:of|for|on|in)\s+(?P<subject>{_STUDY_SUBJECT})"
+        r"(?:\s+(?:today|now|for\s+me))?[.!?]*",
+        cleaned,
+        re.I,
+    )
+    if open_kind_subject is not None:
+        kind_word = open_kind_subject.group("kind").lower()
+        kind = "recorded" if ("record" in kind_word or "video" in kind_word) else (
+            "live" if "stream" in kind_word else "class"
+        )
+        return _study(
+            "open_class",
+            subject=open_kind_subject.group("subject"),
+            kind=kind,
+        )
+
+    live_class = re.fullmatch(
+        r"(?:open|join|start|watch|play)\s+(?:the\s+)?(?:live\s+)?"
+        r"(?P<kind>class|lecture|recording|stream|session|lesson)"
+        r"(?:\s+(?:now|today|live))?[.!?]*",
+        cleaned,
+        re.I,
+    )
+    if live_class is not None:
+        kind_word = live_class.group("kind").lower()
+        kind = "recorded" if "record" in kind_word else (
+            "live" if kind_word == "stream" or "live" in f" {cleaned} " else "class"
+        )
+        return _study("open_class", kind=kind)
+
+    if re.fullmatch(
+        r"(?:get\s+)?(?:the\s+)?(?:system\s+)?ready\s+for\s+study[.!?]*"
+        r"|(?:prepare|get)\s+(?:the\s+)?system\s+for\s+study[.!?]*",
+        cleaned,
+        re.I,
+    ):
+        return _study("prepare")
+
+    if (
+        "study time" in lowered
+        or re.fullmatch(r"(?:study\s+time|study\s+mode|start\s+studying)[.!?]*", cleaned, re.I)
+    ):
+        return _study("open")
+
+    if re.fullmatch(
+        r"(?:open|start|show|go\s+to)\s+(?:the\s+)?(?:my\s+)?"
+        r"(?:study|pw|pw\.live|physics\s+wallah)"
+        r"(?:\s+(?:study\s+)?(?:page|site|website|tab))?[.!?]*",
+        cleaned,
+        re.I,
+    ):
+        return _study("open")
 
     media = _MEDIA_RE.fullmatch(cleaned)
     if media:
